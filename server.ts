@@ -21,8 +21,8 @@ interface ProviderOption {
 }
 
 const CONFIG = {
-  PORT: 3000,
-  HEADLESS: false,
+  PORT: 5000,
+  HEADLESS: true,
   POOL_SIZE: 2,
 } as const;
 
