@@ -52,7 +52,7 @@ function promptProviderSelection(): Promise<ProviderOption> {
       process.stdin.setRawMode(true);
     }
 
-    const renderMenu = (): void => {
+    const renderMenu = () => {
       console.clear();
       console.log('======================================================');
       console.log(' Select an AI Web Provider (Up/Down Arrow + Enter):');
@@ -71,7 +71,7 @@ function promptProviderSelection(): Promise<ProviderOption> {
 
     renderMenu();
 
-    const handleKeypress = (_str: string, key: readline.Key): void => {
+    const handleKeypress = (_str: string, key: readline.Key) => {
       if (key.ctrl && key.name === 'c') {
         process.exit(0);
       }

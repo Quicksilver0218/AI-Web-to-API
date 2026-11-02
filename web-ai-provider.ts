@@ -59,6 +59,9 @@ export abstract class WebAiProvider {
     return { serverName, toolName, description: desc, params };
   }
 
+  /**
+   * 組合首輪上傳的 System Prompt 與 MCP Tools 規範檔案（切換為 @use_mcp_tool JSON 格式）
+   */
   protected buildToolsAndSystemFileContent(systemPrompt = '', tools?: OpenAiTool[]): string {
     let content = `# SYSTEM INSTRUCTIONS & ENVIRONMENT\n\n${systemPrompt.trim()}\n\n`;
 
@@ -66,17 +69,11 @@ export abstract class WebAiProvider {
       content += `=======================================================\n`;
       content += `# CONNECTED MCP TOOLS SPECIFICATIONS\n\n`;
       content += `## Universal Tool Calling Format (STRICT REQUIREMENT)\n`;
-      content += `When you need to call any tool below, you MUST output the raw XML tags directly as plain text.\n`;
-      content += `CRITICAL: NEVER wrap <use_mcp_tool> in markdown code blocks (\`\`\`xml or \`\`\`).\n`;
-      content += `CRITICAL: The arguments tag MUST be written as &lt;arguments&gt; and &lt;/arguments&gt;.\n\n`;
+      content += `When you need to call any tool below, you MUST output a single JSON object prefixed with @use_mcp_tool directly in plain text.\n`;
+      content += `CRITICAL: NEVER wrap @use_mcp_tool in markdown code blocks (\`\`\`json or \`\`\`).\n`;
+      content += `CRITICAL: Output MUST start immediately with @use_mcp_tool followed by the JSON payload.\n\n`;
       content += `Format Structure:\n`;
-      content += `<use_mcp_tool>\n`;
-      content += `<server_name>EXACT_SERVER_NAME_FROM_DEFINITION</server_name>\n`;
-      content += `<tool_name>EXACT_TOOL_NAME_FROM_DEFINITION</tool_name>\n`;
-      content += `&lt;arguments&gt;\n`;
-      content += `{\n  "param": "value"\n}\n`;
-      content += `&lt;/arguments&gt;\n`;
-      content += `</use_mcp_tool>\n\n`;
+      content += `@use_mcp_tool{"server_name":"EXACT_SERVER_NAME_FROM_DEFINITION","tool_name":"EXACT_TOOL_NAME_FROM_DEFINITION","arguments":{"param":"value"}}\n\n`;
       content += `=======================================================\n`;
       content += `## Available Tools Definitions\n\n`;
 
@@ -94,6 +91,9 @@ export abstract class WebAiProvider {
     return content;
   }
 
+  /**
+   * 多輪接續時格式化工具執行結果
+   */
   protected formatContinuationPrompt(messages: ChatMessage[]): string {
     const trailingToolMessages: ChatMessage[] = [];
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -109,36 +109,12 @@ export abstract class WebAiProvider {
       for (const tm of trailingToolMessages) {
         prompt += `\n[Tool Output Data]:\n${tm.content}\n`;
       }
-      prompt += '\nPlease proceed with the task based on the above tool execution results. If you need to invoke another tool, strictly follow the format and output <use_mcp_tool>; if the task is complete, summarize and explain to the user directly.';
+      prompt += '\nPlease proceed with the task based on the above tool execution results. If you need to invoke another tool, strictly output @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}}; if the task is complete, summarize and explain to the user directly.';
       return prompt;
     }
 
     const lastMsg = messages[messages.length - 1];
     return typeof lastMsg?.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg?.content ?? '');
-  }
-
-  protected sanitizeMcpText(text: string): string {
-    let cleaned = text
-      // 1. 移除 Markdown 代碼塊
-      .replace(/```(?:xml)?\s*\n\s*(<use_mcp_tool>)/gi, '$1')
-      .replace(/(<\/use_mcp_tool>)\s*\n\s*```/gi, '$1')
-      // 2. 徹底解碼常見的 HTML 實體與不可見空白
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&amp;/g, '&')
-      .replace(/\u00a0/g, ' ')
-      .replace(/<mcp_arguments>/gi, '<arguments>')
-      .replace(/<\/mcp_arguments>/gi, '</arguments>')
-      .replace(/(<arguments>)\s*```(?:json)?\s*([\s\S]*?)\s*```\s*(<\/arguments>)/gi, '$1\n$2\n$3');
-
-    // 3. 自動補漏：若有 tool_name 與裸露 JSON 但缺少 <arguments>
-    cleaned = cleaned.replace(
-      /(<tool_name>[\s\S]*?<\/tool_name>)\s*(\{[\s\S]*?\})\s*(<\/use_mcp_tool>)/gi,
-      '$1\n<arguments>\n$2\n</arguments>\n$3'
-    );
-
-    return cleaned;
   }
 
   protected resolveExactToolName(parsedToolName: string, tools?: OpenAiTool[]): string {
@@ -159,68 +135,111 @@ export abstract class WebAiProvider {
     return parsedToolName;
   }
 
+  /**
+   * 解析 @use_mcp_tool{...} JSON 格式，並自內容中剝除工具呼叫字串
+   */
   public extractToolCalls(
     fullText: string,
     tools?: OpenAiTool[]
   ): { cleanContent: string; toolCalls: ParsedToolCall[] } {
-    const sanitized = this.sanitizeMcpText(fullText);
     const toolCalls: ParsedToolCall[] = [];
+    const marker = '@use_mcp_tool';
+    let cleanContent = '';
+    let cursor = 0;
 
-    const mcpRegex = /<use_mcp_tool>([\s\S]*?)<\/use_mcp_tool>/gi;
+    while (cursor < fullText.length) {
+      const markerIdx = fullText.indexOf(marker, cursor);
+      if (markerIdx === -1) {
+        cleanContent += fullText.slice(cursor);
+        break;
+      }
 
-    const cleanContent = sanitized.replace(mcpRegex, (_, inner: string) => {
-      const toolMatch = inner.match(/<tool_name>([\s\S]*?)<\/tool_name>/i);
-      const toolNameRaw = toolMatch ? toolMatch[1].trim() : '';
+      // 保留標記之前的純文字
+      cleanContent += fullText.slice(cursor, markerIdx);
 
-      // 1. 優先從 <arguments> 標籤中提取
-      const argsMatch =
-        inner.match(/<arguments>([\s\S]*?)<\/arguments>/i) ||
-        inner.match(/<mcp_arguments>([\s\S]*?)<\/mcp_arguments>/i);
+      // 尋找 JSON 開頭的左括號 {
+      let braceStart = markerIdx + marker.length;
+      while (braceStart < fullText.length && /\s/.test(fullText[braceStart])) {
+        braceStart++;
+      }
 
-      let argsRaw = argsMatch ? argsMatch[1].trim() : '';
+      if (braceStart >= fullText.length || fullText[braceStart] !== '{') {
+        cursor = markerIdx + marker.length;
+        continue;
+      }
 
-      // 2. 【關鍵防禦】：若標籤缺失或撕裂，直接兜底抓取 inner 中任何合法的 { ... } JSON 區塊
-      if (!argsRaw) {
-        const jsonMatch = inner.match(/(\{[\s\S]*\})/);
-        if (jsonMatch) {
-          argsRaw = jsonMatch[1].trim();
-        } else {
-          argsRaw = '{}';
+      // 括號深度計數器（支援字串轉義與巢狀物件）
+      let depth = 0;
+      let inString = false;
+      let escape = false;
+      let braceEnd = -1;
+
+      for (let i = braceStart; i < fullText.length; i++) {
+        const char = fullText[i];
+
+        if (escape) {
+          escape = false;
+          continue;
+        }
+
+        if (char === '\\') {
+          escape = true;
+          continue;
+        }
+
+        if (char === '"') {
+          inString = !inString;
+          continue;
+        }
+
+        if (!inString) {
+          if (char === '{') {
+            depth++;
+          } else if (char === '}') {
+            depth--;
+            if (depth === 0) {
+              braceEnd = i;
+              break;
+            }
+          }
         }
       }
 
-      // 3. 清理可能殘留的代碼塊標記
-      argsRaw = argsRaw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-
-      // 4. 解析與規範化 JSON，處理 Windows 單反斜線問題
-      try {
-        // 1. 自動修復 Windows 單反斜線
-        let fixedJson = argsRaw.replace(/([^\\])\\([^\/"\\bfnrtu])/g, '$1/$2');
-
-        // 2. 自動修復 JSON 字串內部的未轉義換行（避免 Bad control character in string literal）
-        fixedJson = fixedJson.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/g, (match) => {
-          return match
-            .replace(/\r?\n/g, '\\n')
-            .replace(/\t/g, '\\t');
-        });
-
-        argsRaw = JSON.stringify(JSON.parse(fixedJson) as Record<string, unknown>);
-      } catch {
-        // 解析失敗時保留原字串
+      if (braceEnd === -1) {
+        // 未閉合的 JSON，推進游標避免死循環
+        cursor = braceStart + 1;
+        continue;
       }
 
-      const resolvedName = this.resolveExactToolName(toolNameRaw, tools);
+      const jsonStr = fullText.slice(braceStart, braceEnd + 1);
+      cursor = braceEnd + 1;
 
-      toolCalls.push({
-        id: `call_${Math.random().toString(36).substring(2, 11)}`,
-        name: resolvedName,
-        arguments: argsRaw,
-      });
+      try {
+        // 修復 Windows 路徑單反斜線
+        const sanitizedJson = jsonStr.replace(/([^\\])\\([^\/"\\bfnrtu])/g, '$1/$2');
+        const parsed = JSON.parse(sanitizedJson) as Record<string, unknown>;
 
-      return '';
-    }).trim();
+        const toolNameRaw = typeof parsed.tool_name === 'string' ? parsed.tool_name : '';
+        const resolvedName = this.resolveExactToolName(toolNameRaw, tools);
 
-    return { cleanContent, toolCalls };
+        let argsPayload = '{}';
+        if (typeof parsed.arguments === 'object' && parsed.arguments !== null) {
+          argsPayload = JSON.stringify(parsed.arguments);
+        } else if (typeof parsed.arguments === 'string') {
+          argsPayload = parsed.arguments;
+        }
+
+        toolCalls.push({
+          id: `call_${Math.random().toString(36).substring(2, 11)}`,
+          name: resolvedName,
+          arguments: argsPayload,
+        });
+      } catch (err) {
+        console.error('[WebAiProvider] Failed to parse @use_mcp_tool JSON payload:', jsonStr, err);
+      }
+    }
+
+    return { cleanContent: cleanContent.trim(), toolCalls };
   }
 
   public async executeChat(params: {
@@ -253,22 +272,7 @@ export abstract class WebAiProvider {
 
         await this.uploadFile(worker.page, tempFilePath);
 
-        promptToSend = `I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.
-Please read the rules and tool definitions in the attachment carefully.
-
-[CRITICAL TOOL CALLING RULES]:
-1. NEVER output LaTeX/KaTeX math formula symbols ($...$) inside commands or tool arguments. If using PowerShell variables like $global:LASTEXITCODE, write them in plain text without markdown math formatting.
-2. If you need to execute shell commands, you MUST call the "execute_command" tool.
-3. Output exact raw XML tags:
-<use_mcp_tool>
-<server_name>SERVER_NAME</server_name>
-<tool_name>TOOL_NAME</tool_name>
-&lt;arguments&gt;
-{ "param": "value" }
-&lt;/arguments&gt;
-</use_mcp_tool>
-
-Please execute the following task:\n\n${userMsg}`;
+        promptToSend = `I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.\nPlease read the rules and tool definitions in the attachment carefully.\n[CRITICAL EXECUTION RULES]: When you need to call a tool, directly output @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}} in plain text. Paths MUST strictly use forward slashes (/), and NEVER wrap it inside markdown code blocks.\nPlease execute the following task:\n\n${userMsg}`;
       } else {
         promptToSend = this.formatContinuationPrompt(messages);
       }
@@ -278,11 +282,12 @@ Please execute the following task:\n\n${userMsg}`;
       let accumulatedRaw = '';
       let streamedLength = 0;
 
+      // 即時串流過濾：一旦偵測到 @use_mcp_tool 立即扣住，防止打字機洩漏工具 JSON 到畫面上
       const handleRawChunk = (delta: string) => {
         accumulatedRaw += delta;
         if (!onTextDelta) return;
 
-        const toolTagIdx = accumulatedRaw.search(/<use_mcp_tool|&lt;use_mcp_tool/i);
+        const toolTagIdx = accumulatedRaw.search(/@use_mcp_tool/i);
         if (toolTagIdx === -1) {
           const chunkToSend = accumulatedRaw.slice(streamedLength);
           if (chunkToSend) {
@@ -309,7 +314,7 @@ Please execute the following task:\n\n${userMsg}`;
       };
     } finally {
       if (tempFilePath) {
-        await fs.unlink(tempFilePath).catch(() => { });
+        await fs.unlink(tempFilePath).catch(() => {});
       }
     }
   }

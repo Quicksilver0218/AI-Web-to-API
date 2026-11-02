@@ -67,12 +67,12 @@ export class GeminiProvider extends WebAiProvider {
         console.log(`[Gemini] Switching to existing conversation: ${targetFullUrl}`);
         await page.goto(targetFullUrl, { waitUntil: 'domcontentloaded' });
       } else {
-        console.log(`[Gemini] Tab is already on the target conversation page (${targetPath}), continuing directly.`);
+        console.log(`[Gemini] Tab is already on target conversation (${targetPath}), continuing directly.`);
       }
     } else {
       const currentUrlObj = new URL(page.url());
       if (currentUrlObj.pathname !== '/app') {
-        console.log(`[Gemini] Opening new conversation home page...`);
+        console.log('[Gemini] Opening new conversation home page...');
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
       }
     }
@@ -91,21 +91,54 @@ export class GeminiProvider extends WebAiProvider {
     const responseLocator = page.locator(this.selectors.RESPONSE_CONTAINER);
     const targetIndex = await responseLocator.count();
 
+    // 1. 填入內容並強制觸發 Angular 內部事件
     await input.click();
     await input.fill(prompt);
+    await input.dispatchEvent('input');
+    await input.dispatchEvent('change');
+    await page.waitForTimeout(300);
 
-    const sendBtn = page.locator(this.selectors.SEND_BUTTON).first();
-    if (await sendBtn.isVisible()) {
-      await sendBtn.click();
-    } else {
-      await page.keyboard.press('Enter');
+    // 2. 定位「已啟用」的傳送按鈕（排除 disabled 與 aria-disabled="true"）
+    const activeSendBtn = page.locator(
+      'button[aria-label*="傳送"]:not([disabled]):not([aria-disabled="true"]), ' +
+      'button[aria-label*="Send"]:not([disabled]):not([aria-disabled="true"])'
+    ).first();
+
+    let sent = false;
+
+    try {
+      // 等待按鈕轉為可點擊狀態（最多等待 4 秒）
+      await activeSendBtn.waitFor({ state: 'visible', timeout: 4000 });
+      await activeSendBtn.click({ timeout: 2000 });
+      sent = true;
+    } catch {
+      console.log(`[Gemini] Worker #${id} active send button not ready, trying Enter key fallback...`);
     }
 
-    // No timeout constraint to prevent false timeouts during long generation
+    if (!sent) {
+      // 點擊無效時聚焦輸入框並使用 Enter 送出
+      await input.focus();
+      await input.press('Enter');
+    }
+
+    // 3. 【防呆二次確認】：檢查輸入框是否已被清空
+    await page.waitForTimeout(600);
+    const remainingText = await input.innerText();
+    if (remainingText.trim().length > 0) {
+      console.log(`[Gemini] Worker #${id} prompt still remaining in editor, executing forced submission...`);
+      const fallbackBtn = page.locator(this.selectors.SEND_BUTTON).first();
+      try {
+        await fallbackBtn.click({ force: true, timeout: 2000 });
+      } catch {
+        await input.focus();
+        await page.keyboard.press('Control+Enter');
+      }
+    }
+
+    // 4. 等待新回覆容器生成（無 timeout 限制）
     await page.waitForFunction(
       ({ selector, count }: WaitForFunctionParams) => document.querySelectorAll(selector).length > count,
-      { selector: this.selectors.RESPONSE_CONTAINER, count: targetIndex },
-      { timeout: 0 }
+      { selector: this.selectors.RESPONSE_CONTAINER, count: targetIndex }
     );
 
     let rawFullText = '';
@@ -115,12 +148,128 @@ export class GeminiProvider extends WebAiProvider {
     };
     emitter.on('chunk', chunkListener);
 
+    let finalDomText = '';
+
     try {
-      await page.evaluate(
+      finalDomText = await page.evaluate(
         ({ selector, index, stopSelector }: BrowserEvaluateParams) => {
-          return new Promise<void>((resolve) => {
+          return new Promise<string>((resolve) => {
             const container = document.querySelectorAll(selector)[index] as HTMLElement | undefined;
             const customWindow = window as unknown as WindowWithCustomEvents;
+
+            function serializeCellContent(cell: Element): string {
+              const cellClone = cell.cloneNode(true) as HTMLElement;
+
+              cellClone.querySelectorAll('code').forEach((code) => {
+                code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
+              });
+
+              cellClone.querySelectorAll('strong, b').forEach((b) => {
+                b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
+              });
+
+              cellClone.querySelectorAll('em, i').forEach((em) => {
+                em.replaceWith(document.createTextNode(`*${em.textContent ?? ''}*`));
+              });
+
+              const raw = cellClone.textContent ?? '';
+              return raw.trim().replace(/\r?\n+/g, ' ').replace(/\|/g, '\\|');
+            }
+
+            function convertTableToMarkdown(table: HTMLTableElement): string {
+              const rows = Array.from(table.querySelectorAll('tr'));
+              if (rows.length === 0) return '';
+
+              const mdRows: string[] = [];
+              let colCount = 0;
+              let delimiterSet = false;
+              const thead = table.querySelector('thead');
+
+              for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                const cells = Array.from(row.querySelectorAll('th, td'));
+                if (cells.length === 0) continue;
+
+                let cellTexts = cells.map(serializeCellContent);
+                const isHeader = thead ? thead.contains(row) : i === 0;
+
+                if (isHeader) {
+                  colCount = cellTexts.length;
+                  mdRows.push(`| ${cellTexts.join(' | ')} |`);
+                  if (!delimiterSet) {
+                    mdRows.push(`| ${cellTexts.map(() => '---').join(' | ')} |`);
+                    delimiterSet = true;
+                  }
+                } else {
+                  while (colCount > 0 && cellTexts.length < colCount) {
+                    cellTexts.push('');
+                  }
+                  mdRows.push(`| ${cellTexts.join(' | ')} |`);
+                }
+              }
+
+              return `\n\n${mdRows.join('\n')}\n\n`;
+            }
+
+            function extractCleanText(root: HTMLElement | undefined): string {
+              if (!root) return '';
+              const clone = root.cloneNode(true) as HTMLElement;
+
+              clone.querySelectorAll(
+                '.table-footer, gem-icon-button, gem-popover, button, .mat-mdc-button-touch-target, [hide-from-message-actions], mat-icon'
+              ).forEach((el) => el.remove());
+
+              clone.querySelectorAll('.katex').forEach((katex) => {
+                const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
+                const rawTex = annotation?.textContent ?? '';
+                katex.replaceWith(document.createTextNode(`$${rawTex}$`));
+              });
+
+              clone.querySelectorAll('table').forEach((table) => {
+                const mdTable = convertTableToMarkdown(table as HTMLTableElement);
+                const wrapper =
+                  table.closest('.horizontal-scroll-wrapper') ||
+                  table.closest('table-block') ||
+                  table;
+                wrapper.replaceWith(document.createTextNode(mdTable));
+              });
+
+              clone.querySelectorAll('pre').forEach((pre) => {
+                const code = pre.querySelector('code');
+                const content = (code ?? pre).textContent ?? '';
+                pre.replaceWith(document.createTextNode(`\n\`\`\`\n${content}\n\`\`\`\n`));
+              });
+
+              clone.querySelectorAll('code').forEach((code) => {
+                code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
+              });
+              clone.querySelectorAll('b, strong').forEach((b) => {
+                b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
+              });
+
+              clone.querySelectorAll('h1').forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
+              clone.querySelectorAll('h2').forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
+              clone.querySelectorAll('h3').forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
+              clone.querySelectorAll('h4, h5, h6').forEach((h) => h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`)));
+
+              clone.querySelectorAll('li').forEach((li) => {
+                li.querySelectorAll('p').forEach((p) => {
+                  p.replaceWith(document.createTextNode(p.textContent?.trim() ?? ''));
+                });
+                const text = li.textContent?.trim() ?? '';
+                li.replaceWith(document.createTextNode(`\n- ${text}\n`));
+              });
+
+              clone.querySelectorAll('p').forEach((p) => {
+                const text = p.textContent?.trim() ?? '';
+                if (text) {
+                  p.replaceWith(document.createTextNode(`\n\n${text}\n\n`));
+                }
+              });
+
+              const raw = clone.textContent ?? '';
+              return raw.replace(/\n{3,}/g, '\n\n').trim();
+            }
 
             let lastLen = 0;
             let isDone = false;
@@ -128,7 +277,7 @@ export class GeminiProvider extends WebAiProvider {
 
             function emitDelta() {
               if (!container) return;
-              const currentText = container.innerText || '';
+              const currentText = extractCleanText(container);
               if (currentText.length > lastLen) {
                 const delta = currentText.slice(lastLen);
                 lastLen = currentText.length;
@@ -144,7 +293,7 @@ export class GeminiProvider extends WebAiProvider {
               if (stopCheckInterval !== null) clearInterval(stopCheckInterval);
               if (stabilityTimer !== null) clearTimeout(stabilityTimer);
               customWindow.__pushDone();
-              resolve();
+              resolve(extractCleanText(container));
             }
 
             const observer = new MutationObserver(() => {
@@ -190,8 +339,9 @@ export class GeminiProvider extends WebAiProvider {
 
     const currentUrlObj = new URL(page.url());
     const currentPath = currentUrlObj.pathname;
+    const resolvedText = finalDomText.trim() ? finalDomText : rawFullText;
 
     console.log(`[Gemini] Worker #${id} generation completed. Current URL path: ${currentPath}`);
-    return { rawText: rawFullText, currentPath };
+    return { rawText: resolvedText, currentPath };
   }
 }

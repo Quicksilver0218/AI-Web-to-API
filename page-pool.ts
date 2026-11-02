@@ -93,7 +93,7 @@ export class PagePool {
     });
   }
 
-  release(worker: PageWorker): void {
+  release(worker: PageWorker) {
     worker.emitter.removeAllListeners();
     worker.busy = false;
 

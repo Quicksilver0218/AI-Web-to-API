@@ -89,11 +89,9 @@ export class DeepSeekProvider extends WebAiProvider {
     const input = page.locator(this.selectors.PROMPT_INPUT).first();
     await input.waitFor({ state: 'visible', timeout: 15000 });
 
-    // 1. Get current response count before sending prompt
     const prevCount = await this.getVirtualResponseCount(page);
     console.log(`[DeepSeek] Worker #${id} current response count before prompt: ${prevCount}`);
 
-    // 2. Input and submit prompt
     await input.click();
     await input.fill(prompt);
     await input.dispatchEvent('input');
@@ -106,15 +104,13 @@ export class DeepSeekProvider extends WebAiProvider {
         await sendBtn.click({ timeout: 2000 });
         sent = true;
       } catch {
-        // Fall back to enter key if click is intercepted
+        // Fall back to keypress if button click is obstructed
       }
     }
-
     if (!sent) {
       await input.press('Enter');
     }
 
-    // 3. Wait until the virtual item key updates (maxKey / 2 > prevCount)
     await page.waitForFunction(
       ({ selector, prevCount }: WaitForResponseParams) => {
         const elements = Array.from(document.querySelectorAll(selector));
@@ -139,10 +135,10 @@ export class DeepSeekProvider extends WebAiProvider {
     };
     emitter.on('chunk', chunkListener);
 
-    let finalDomText = '';
+    let finalExtractedText = '';
 
     try {
-      finalDomText = await page.evaluate(
+      finalExtractedText = await page.evaluate(
         ({ selector }: ObserveStreamParams) => {
           return new Promise<string>((resolve) => {
             const customWindow = window as unknown as WindowWithCustomEvents;
@@ -153,33 +149,140 @@ export class DeepSeekProvider extends WebAiProvider {
               return elements[elements.length - 1] as HTMLElement;
             }
 
-            // 【關鍵修復】：逆向還原被 KaTeX 渲染破壞的原始文字
-            function extractCleanText(element: HTMLElement | null): string {
-              if (!element) return '';
-              const clone = element.cloneNode(true) as HTMLElement;
+            // ================= 核心策略 1：從 React Fiber 直接取回未污染的原始 Markdown =================
+            function getReactRawMarkdown(container: HTMLElement | null): string | null {
+              if (!container) return null;
+              const targets = [
+                container,
+                container.parentElement,
+                container.closest('.ds-markdown'),
+                container.closest('[data-virtual-list-item-key]'),
+              ];
 
-              // 尋找所有被轉成 LaTeX 公式的節點
-              const katexElements = clone.querySelectorAll('.katex');
-              katexElements.forEach((katex) => {
-                // KaTeX 會在 <annotation encoding="application/x-tex"> 內保留完整的原始字串
+              for (const el of targets) {
+                if (!el) continue;
+                const fiberKey = Object.keys(el).find(
+                  (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
+                );
+                if (!fiberKey) continue;
+
+                let fiber = (el as Record<string, any>)[fiberKey];
+                let depth = 0;
+                while (fiber && depth < 25) {
+                  const props = fiber.memoizedProps;
+                  if (props) {
+                    if (typeof props.content === 'string' && props.content.trim().length > 0) {
+                      return props.content;
+                    }
+                    if (typeof props.text === 'string' && props.text.trim().length > 0) {
+                      return props.text;
+                    }
+                    if (typeof props.rawContent === 'string' && props.rawContent.trim().length > 0) {
+                      return props.rawContent;
+                    }
+                    if (props.message && typeof props.message.content === 'string' && props.message.content.trim().length > 0) {
+                      return props.message.content;
+                    }
+                  }
+                  fiber = fiber.return;
+                  depth++;
+                }
+              }
+              return null;
+            }
+
+            // ================= 核心策略 2：全節點 DOM 逆向解析器（降級防線） =================
+            function domToMarkdownFallback(container: HTMLElement | null): string {
+              if (!container) return '';
+              const clone = container.cloneNode(true) as HTMLElement;
+
+              // 移除滾動條陰影等干擾節點
+              clone.querySelectorAll('.ds-scroll-area__gutters, [class*="gutter"]').forEach((el) => el.remove());
+
+              // 還原 KaTeX 公式
+              clone.querySelectorAll('.katex').forEach((katex) => {
                 const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
                 const rawTex = annotation?.textContent ?? '';
-                // 將公式標籤替換回原本的 $...$ 原始代碼
                 katex.replaceWith(document.createTextNode(`$${rawTex}$`));
               });
 
-              return clone.innerText || '';
+              // 還原標題（H1-H6）
+              clone.querySelectorAll('h1').forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
+              clone.querySelectorAll('h2').forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
+              clone.querySelectorAll('h3').forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
+              clone.querySelectorAll('h4, h5, h6').forEach((h) => h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`)));
+
+              // 還原清單項目
+              clone.querySelectorAll('li').forEach((li) => {
+                const text = li.textContent?.trim() ?? '';
+                li.replaceWith(document.createTextNode(`\n- ${text}\n`));
+              });
+
+              // 還原段落
+              clone.querySelectorAll('p, .ds-markdown-paragraph').forEach((p) => {
+                const text = p.textContent?.trim() ?? '';
+                if (text) {
+                  p.replaceWith(document.createTextNode(`\n\n${text}\n\n`));
+                }
+              });
+
+              // 還原表格
+              clone.querySelectorAll('table').forEach((table) => {
+                const rows = Array.from(table.querySelectorAll('tr'));
+                if (rows.length === 0) return;
+
+                const mdRows: string[] = [];
+                let colCount = 0;
+                let delimiterSet = false;
+
+                for (let i = 0; i < rows.length; i++) {
+                  const cells = Array.from(rows[i].querySelectorAll('th, td'));
+                  if (cells.length === 0) continue;
+
+                  const cellTexts = cells.map((c) => {
+                    const cClone = c.cloneNode(true) as HTMLElement;
+                    cClone.querySelectorAll('code').forEach((cd) => cd.replaceWith(document.createTextNode(`\`${cd.textContent ?? ''}\``)));
+                    cClone.querySelectorAll('strong, b').forEach((b) => b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`)));
+                    return (cClone.textContent ?? '').trim().replace(/\r?\n+/g, ' ').replace(/\|/g, '\\|');
+                  });
+
+                  if (i === 0) {
+                    colCount = cellTexts.length;
+                    mdRows.push(`| ${cellTexts.join(' | ')} |`);
+                    if (!delimiterSet) {
+                      mdRows.push(`| ${cellTexts.map(() => '---').join(' | ')} |`);
+                      delimiterSet = true;
+                    }
+                  } else {
+                    while (colCount > 0 && cellTexts.length < colCount) {
+                      cellTexts.push('');
+                    }
+                    mdRows.push(`| ${cellTexts.join(' | ')} |`);
+                  }
+                }
+
+                table.replaceWith(document.createTextNode(`\n\n${mdRows.join('\n')}\n\n`));
+              });
+
+              // 使用 textContent 提取，避免 innerText 的 CSS 樣式坍塌
+              const raw = clone.textContent ?? '';
+              return raw.replace(/\n{3,}/g, '\n\n').trim();
+            }
+
+            function getBestText(): string {
+              const container = getLatestContainer();
+              if (!container) return '';
+              const rawReact = getReactRawMarkdown(container);
+              if (rawReact) return rawReact;
+              return domToMarkdownFallback(container);
             }
 
             let lastLen = 0;
             let isDone = false;
             let stabilityTimer: number | null = null;
 
-            function emitDelta(): void {
-              const container = getLatestContainer();
-              if (!container) return;
-              // 使用逆向還原後的純文字，而不是未處理的 innerText
-              const currentText = extractCleanText(container);
+            function emitDelta() {
+              const currentText = getBestText();
               if (currentText.length > lastLen) {
                 const delta = currentText.slice(lastLen);
                 lastLen = currentText.length;
@@ -187,17 +290,14 @@ export class DeepSeekProvider extends WebAiProvider {
               }
             }
 
-            function complete(): void {
+            function complete() {
               if (isDone) return;
               isDone = true;
               emitDelta();
               if (observer) observer.disconnect();
               if (stabilityTimer !== null) clearTimeout(stabilityTimer);
               customWindow.__pushDone();
-
-              // 生成完畢後，直接提取當前容器最終完整的 innerText
-              const container = getLatestContainer();
-              resolve(container ? (container.innerText || '') : '');
+              resolve(getBestText());
             }
 
             const observer = new MutationObserver(() => {
@@ -225,9 +325,7 @@ export class DeepSeekProvider extends WebAiProvider {
 
     const currentUrlObj = new URL(page.url());
     const currentPath = currentUrlObj.pathname;
-
-    // 優先使用 DOM 最終完整文本，若無則回退至串流累積文字
-    const resolvedText = finalDomText.trim() ? finalDomText : rawFullText;
+    const resolvedText = finalExtractedText.trim() ? finalExtractedText : rawFullText;
 
     console.log(`[DeepSeek] Worker #${id} generation completed. Current URL path: ${currentPath}`);
     return { rawText: resolvedText, currentPath };
