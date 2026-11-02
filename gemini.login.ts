@@ -5,7 +5,7 @@ import readline from 'readline';
 const USER_DATA_DIR = path.join(import.meta.dirname, './gemini_profile');
 
 async function launchLoginFlow() {
-  console.log('正在開啟登入引導視窗...');
+  console.log('[Gemini Login] Launching Chrome window with persistent profile...');
 
   // 使用持久化目錄啟動真實 Chrome 視窗
   const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
@@ -21,19 +21,23 @@ async function launchLoginFlow() {
   await page.goto('https://accounts.google.com/ServiceLogin?continue=https://gemini.google.com/app');
 
   console.log('\n======================================================');
-  console.log('1. 請在跳出的瀏覽器視窗中手動輸入 Google 帳號與密碼。');
-  console.log('2. 完成 2FA 二步驟驗證（若有勾選「在此裝置記住我」請勾選）。');
-  console.log('3. 確認網頁已順利進入 Gemini 對話首頁。');
-  console.log('4. 完成後回到此終端機，按下 Enter 鍵保存並關閉。');
+  console.log('1. Please complete the login process in the opened browser window.');
+  console.log('2. Pass any Cloudflare Turnstile or CAPTCHA verification if prompted.');
+  console.log('3. Verify that you have reached the main DeepSeek chat interface.');
+  console.log('4. Return to this terminal and press Enter to save the session and exit.');
   console.log('======================================================\n');
 
   // 等待終端機確認
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  await new Promise((resolve) => rl.question('完成登入後請按 Enter: ', resolve));
+  await new Promise((resolve) => rl.question('Press Enter after completing login: ', resolve));
   rl.close();
 
   await context.close();
-  console.log('登入狀態已成功持久化保存至 ./gemini_profile！');
+  console.log(`[Gemini Login] Session successfully saved to: ${USER_DATA_DIR}`);
 }
 
-launchLoginFlow().catch(console.error);
+launchLoginFlow().catch((err: unknown) => {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error('[Gemini Login] Fatal error:', message);
+  process.exit(1);
+});

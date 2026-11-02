@@ -119,13 +119,20 @@ export abstract class WebAiProvider {
 
   protected sanitizeMcpText(text: string): string {
     let cleaned = text
+      // 1. 移除 Markdown 代碼塊
       .replace(/```(?:xml)?\s*\n\s*(<use_mcp_tool>)/gi, '$1')
       .replace(/(<\/use_mcp_tool>)\s*\n\s*```/gi, '$1')
-      .replace(/&lt;(\/?(?:use_mcp_tool|server_name|tool_name|arguments))&gt;/gi, '<$1>')
+      // 2. 徹底解碼常見的 HTML 實體與不可見空白
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/\u00a0/g, ' ')
       .replace(/<mcp_arguments>/gi, '<arguments>')
       .replace(/<\/mcp_arguments>/gi, '</arguments>')
       .replace(/(<arguments>)\s*```(?:json)?\s*([\s\S]*?)\s*```\s*(<\/arguments>)/gi, '$1\n$2\n$3');
 
+    // 3. 自動補漏：若有 tool_name 與裸露 JSON 但缺少 <arguments>
     cleaned = cleaned.replace(
       /(<tool_name>[\s\S]*?<\/tool_name>)\s*(\{[\s\S]*?\})\s*(<\/use_mcp_tool>)/gi,
       '$1\n<arguments>\n$2\n</arguments>\n$3'
@@ -159,21 +166,47 @@ export abstract class WebAiProvider {
     const sanitized = this.sanitizeMcpText(fullText);
     const toolCalls: ParsedToolCall[] = [];
 
-    const regex = /<use_mcp_tool>([\s\S]*?)<\/use_mcp_tool>/gi;
+    const mcpRegex = /<use_mcp_tool>([\s\S]*?)<\/use_mcp_tool>/gi;
 
-    const cleanContent = sanitized.replace(regex, (_, inner: string) => {
+    const cleanContent = sanitized.replace(mcpRegex, (_, inner: string) => {
       const toolMatch = inner.match(/<tool_name>([\s\S]*?)<\/tool_name>/i);
-      const argsMatch = inner.match(/<arguments>([\s\S]*?)<\/arguments>/i);
-
       const toolNameRaw = toolMatch ? toolMatch[1].trim() : '';
-      let argsRaw = argsMatch ? argsMatch[1].trim() : '{}';
 
+      // 1. 優先從 <arguments> 標籤中提取
+      const argsMatch =
+        inner.match(/<arguments>([\s\S]*?)<\/arguments>/i) ||
+        inner.match(/<mcp_arguments>([\s\S]*?)<\/mcp_arguments>/i);
+
+      let argsRaw = argsMatch ? argsMatch[1].trim() : '';
+
+      // 2. 【關鍵防禦】：若標籤缺失或撕裂，直接兜底抓取 inner 中任何合法的 { ... } JSON 區塊
+      if (!argsRaw) {
+        const jsonMatch = inner.match(/(\{[\s\S]*\})/);
+        if (jsonMatch) {
+          argsRaw = jsonMatch[1].trim();
+        } else {
+          argsRaw = '{}';
+        }
+      }
+
+      // 3. 清理可能殘留的代碼塊標記
       argsRaw = argsRaw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+
+      // 4. 解析與規範化 JSON，處理 Windows 單反斜線問題
       try {
-        const fixedJson = argsRaw.replace(/([^\\])\\([^\/"\\bfnrtu])/g, '$1/$2');
+        // 1. 自動修復 Windows 單反斜線
+        let fixedJson = argsRaw.replace(/([^\\])\\([^\/"\\bfnrtu])/g, '$1/$2');
+
+        // 2. 自動修復 JSON 字串內部的未轉義換行（避免 Bad control character in string literal）
+        fixedJson = fixedJson.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/g, (match) => {
+          return match
+            .replace(/\r?\n/g, '\\n')
+            .replace(/\t/g, '\\t');
+        });
+
         argsRaw = JSON.stringify(JSON.parse(fixedJson) as Record<string, unknown>);
       } catch {
-        // Keep raw string if parsing fails
+        // 解析失敗時保留原字串
       }
 
       const resolvedName = this.resolveExactToolName(toolNameRaw, tools);
@@ -220,7 +253,22 @@ export abstract class WebAiProvider {
 
         await this.uploadFile(worker.page, tempFilePath);
 
-        promptToSend = `I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.\nPlease read the rules and tool definitions in the attachment carefully.\n[CRITICAL EXECUTION RULES]: When you need to call a tool, directly output raw <use_mcp_tool> tags as plain text. The arguments tag MUST be written as &lt;arguments&gt; and &lt;/arguments&gt;, paths MUST strictly use forward slashes (/), and NEVER wrap them inside markdown code blocks.\nPlease execute the following task:\n\n${userMsg}`;
+        promptToSend = `I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.
+Please read the rules and tool definitions in the attachment carefully.
+
+[CRITICAL TOOL CALLING RULES]:
+1. NEVER output LaTeX/KaTeX math formula symbols ($...$) inside commands or tool arguments. If using PowerShell variables like $global:LASTEXITCODE, write them in plain text without markdown math formatting.
+2. If you need to execute shell commands, you MUST call the "execute_command" tool.
+3. Output exact raw XML tags:
+<use_mcp_tool>
+<server_name>SERVER_NAME</server_name>
+<tool_name>TOOL_NAME</tool_name>
+&lt;arguments&gt;
+{ "param": "value" }
+&lt;/arguments&gt;
+</use_mcp_tool>
+
+Please execute the following task:\n\n${userMsg}`;
       } else {
         promptToSend = this.formatContinuationPrompt(messages);
       }
@@ -261,7 +309,7 @@ export abstract class WebAiProvider {
       };
     } finally {
       if (tempFilePath) {
-        await fs.unlink(tempFilePath).catch(() => {});
+        await fs.unlink(tempFilePath).catch(() => { });
       }
     }
   }

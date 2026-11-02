@@ -104,7 +104,8 @@ export class GeminiProvider extends WebAiProvider {
     // No timeout constraint to prevent false timeouts during long generation
     await page.waitForFunction(
       ({ selector, count }: WaitForFunctionParams) => document.querySelectorAll(selector).length > count,
-      { selector: this.selectors.RESPONSE_CONTAINER, count: targetIndex }
+      { selector: this.selectors.RESPONSE_CONTAINER, count: targetIndex },
+      { timeout: 0 }
     );
 
     let rawFullText = '';
