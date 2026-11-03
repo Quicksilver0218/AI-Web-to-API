@@ -1,14 +1,12 @@
 import { chromium } from 'playwright';
-import path from 'path';
 import readline from 'readline';
 
-const USER_DATA_DIR = path.join(import.meta.dirname, './deepseek_profile');
 const DEEPSEEK_URL = 'https://chat.deepseek.com/';
 
-async function launchLoginFlow(): Promise<void> {
+export async function runLoginFlow(profilePath: string): Promise<void> {
   console.log('[DeepSeek Login] Launching Chrome window with persistent profile...');
 
-  const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
+  const context = await chromium.launchPersistentContext(profilePath, {
     headless: false,
     channel: 'chrome',
     viewport: { width: 1280, height: 800 },
@@ -40,11 +38,5 @@ async function launchLoginFlow(): Promise<void> {
 
   rl.close();
   await context.close();
-  console.log(`[DeepSeek Login] Session successfully saved to: ${USER_DATA_DIR}`);
+  console.log(`[DeepSeek Login] Session successfully saved to: ${profilePath}`);
 }
-
-launchLoginFlow().catch((err: unknown) => {
-  const message = err instanceof Error ? err.message : String(err);
-  console.error('[DeepSeek Login] Fatal error:', message);
-  process.exit(1);
-});

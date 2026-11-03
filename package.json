@@ -1,5 +1,20 @@
 {
+  "name": "ai-web-to-api",
+  "version": "0.0.1",
   "type": "module",
+  "main": "dist",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node build.ts",
+    "start": "node dist/index.js",
+    "lint": "eslint src/** --fix",
+    "prepare": "npm run build"
+  },
+  "bin": {
+    "ai-web-to-api": "dist/index.js"
+  },
   "dependencies": {
     "playwright": "^1.64.1"
   },
@@ -8,6 +23,5 @@
     "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
-  },
-  "scripts": {}
+  }
 }

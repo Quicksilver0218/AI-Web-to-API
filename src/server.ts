@@ -1,100 +1,28 @@
 import http, { IncomingMessage, ServerResponse } from 'http';
-import readline from 'readline';
-import path from 'path';
 import crypto from 'crypto';
+import path from 'path';
 import type {
   ChatMessage,
   ChatCompletionRequestBody,
   ChatCompletionChunk,
   ChatCompletionResponse,
 } from './types.ts';
-import { WebAiProvider } from './web-ai-provider.ts';
-import { DeepSeekProvider } from './deepseek.provider.ts';
-import { GeminiProvider } from './gemini.provider.ts';
-import { PagePool } from './page-pool.ts';
+import { WebAiProvider } from './web-ai-provider.js';
+import { PagePool } from './page-pool.js';
 
-interface ProviderOption {
-  id: 'gemini' | 'deepseek';
+export interface ProviderSelection {
   label: string;
   provider: WebAiProvider;
   profilePath: string;
 }
 
-const CONFIG = {
-  PORT: 5000,
-  HEADLESS: true,
-  POOL_SIZE: 2,
-} as const;
-
-const AVAILABLE_PROVIDERS: ProviderOption[] = [
-  {
-    id: 'gemini',
-    label: 'Google Gemini (Web)',
-    provider: new GeminiProvider(),
-    profilePath: path.join(import.meta.dirname, './gemini_profile'),
-  },
-  {
-    id: 'deepseek',
-    label: 'DeepSeek Chat (Web)',
-    provider: new DeepSeekProvider(),
-    profilePath: path.join(import.meta.dirname, './deepseek_profile'),
-  },
-];
+export interface StartServerConfig {
+  port: number;
+  poolSize: number;
+  headless: boolean;
+}
 
 const sessionStore = new Map<string, string>();
-
-function promptProviderSelection(): Promise<ProviderOption> {
-  return new Promise<ProviderOption>((resolve) => {
-    let selectedIndex = 0;
-
-    readline.emitKeypressEvents(process.stdin);
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(true);
-    }
-
-    const renderMenu = () => {
-      console.clear();
-      console.log('======================================================');
-      console.log(' Select an AI Web Provider (Up/Down Arrow + Enter):');
-      console.log('======================================================\n');
-
-      AVAILABLE_PROVIDERS.forEach((item, idx) => {
-        if (idx === selectedIndex) {
-          console.log(` \x1b[36m> [x] ${item.label} (${item.id})\x1b[0m`);
-        } else {
-          console.log(`   [ ] ${item.label} (${item.id})`);
-        }
-      });
-
-      console.log('\n(Press Ctrl+C to cancel)');
-    };
-
-    renderMenu();
-
-    const handleKeypress = (_str: string, key: readline.Key) => {
-      if (key.ctrl && key.name === 'c') {
-        process.exit(0);
-      }
-
-      if (key.name === 'up') {
-        selectedIndex = (selectedIndex - 1 + AVAILABLE_PROVIDERS.length) % AVAILABLE_PROVIDERS.length;
-        renderMenu();
-      } else if (key.name === 'down') {
-        selectedIndex = (selectedIndex + 1) % AVAILABLE_PROVIDERS.length;
-        renderMenu();
-      } else if (key.name === 'return' || key.name === 'enter') {
-        if (process.stdin.isTTY) {
-          process.stdin.setRawMode(false);
-        }
-        process.stdin.removeListener('keypress', handleKeypress);
-        console.clear();
-        resolve(AVAILABLE_PROVIDERS[selectedIndex]);
-      }
-    };
-
-    process.stdin.on('keypress', handleKeypress);
-  });
-}
 
 function getTaskFingerprint(messages: ChatMessage[]): string {
   const firstUserMsg = messages.find((m) => m.role === 'user')?.content ?? '';
@@ -126,17 +54,19 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
-async function startServer(): Promise<void> {
-  const selected = await promptProviderSelection();
+export async function startServer(
+  selected: ProviderSelection,
+  config: StartServerConfig,
+): Promise<void> {
   const { provider, profilePath } = selected;
   const defaultHomePath = new URL(provider.baseUrl).pathname;
 
   console.log(`[Startup] Initializing dedicated tab pool for: ${selected.label}...`);
 
   const pool = new PagePool({
-    userDataDir: profilePath,
-    headless: CONFIG.HEADLESS,
-    poolSize: CONFIG.POOL_SIZE,
+    userDataDir: path.join(import.meta.dirname, profilePath),
+    headless: config.headless,
+    poolSize: config.poolSize,
     initialUrl: provider.baseUrl,
   });
 
@@ -331,13 +261,8 @@ async function startServer(): Promise<void> {
     res.end(JSON.stringify({ error: 'Not Found' }));
   });
 
-  server.listen(CONFIG.PORT, () => {
-    console.log(`[Ready] Single-provider bridge running at: http://localhost:${CONFIG.PORT}/v1/chat/completions`);
+  server.listen(config.port, () => {
+    console.log(`[Ready] Single-provider bridge running at: http://localhost:${config.port}/v1/chat/completions`);
     console.log(`[Ready] Active Provider: ${selected.label}`);
   });
 }
-
-startServer().catch((err: unknown) => {
-  console.error('[Fatal Error]:', getErrorMessage(err));
-  process.exit(1);
-});

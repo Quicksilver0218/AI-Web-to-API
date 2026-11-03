@@ -1,5 +1,5 @@
 import type { Page } from 'playwright';
-import { WebAiProvider } from './web-ai-provider.ts';
+import { WebAiProvider } from './web-ai-provider.js';
 import type { PageWorker, WindowWithCustomEvents } from './types.ts';
 
 interface WaitForResponseParams {

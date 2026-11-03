@@ -1,17 +1,14 @@
 # AI Web to API
 ## Usage
 1. Install Node.js
-2. Install Playwright
+2. Run the script
+   
+   `npx --allow-git all -y github:Quicksilver0218/AI-Web-to-API -p (port)`
 
-   `npx playwright install`
-3. Run the login script (e.g. `node deepseek.login.ts`)
-4. Log in to the website in your browser
+3. Select log in on the first execution
+4. Log in to the website in the pop-up browser
 5. Go back to the terminal and press `Enter` to continue
-6. Start the server
-
-   `node server.js`
-
-7. Configure your coding assistant
+6. Configure your coding assistant
    - API Provider: OpenAI Compatible
-   - Base URL: http://localhost:5000/v1
+   - Base URL: http://localhost:(port)/v1
    - Add a recognizable model ID as you like

@@ -1,4 +1,5 @@
 node_modules/
 gemini_profile/
 deepseek_profile/
+dist/
 package-lock.json
