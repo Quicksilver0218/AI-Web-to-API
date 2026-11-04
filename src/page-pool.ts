@@ -1,6 +1,7 @@
 import { chromium, type BrowserContext } from 'playwright';
 import { EventEmitter } from 'events';
 import { type PageWorker } from './types.js';
+import { waitForVpnConnection } from './utils.js';
 
 export interface PagePoolOptions {
   userDataDir: string;
@@ -19,11 +20,11 @@ export class PagePool {
     this.options = options;
   }
 
-  async init(): Promise<void> {
+  async init(extensionPath?: string): Promise<void> {
     console.log('Launching Chromium sandbox environment...');
     this.context = await chromium.launchPersistentContext(this.options.userDataDir, {
       headless: this.options.headless,
-      channel: 'chrome',
+      channel: 'chromium',
       viewport: { width: 1280, height: 800 },
       permissions: ['clipboard-read', 'clipboard-write'],
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
@@ -38,8 +39,13 @@ export class PagePool {
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
+        ...extensionPath ? [
+          `--disable-extensions-except=${extensionPath}`,
+          `--load-extension=${extensionPath}`
+        ] : [],
       ],
     });
+    this.context.setDefaultTimeout(0);
 
     await this.context.route('**/*', (route) => {
       const type = route.request().resourceType();
@@ -49,12 +55,14 @@ export class PagePool {
 
     const initialPages = this.context.pages();
     if (initialPages.length > 0) {
-      await Promise.all(initialPages.map((p) => p.close().catch(() => {})));
+      await Promise.all(initialPages.map((p) => p.close().catch(() => { })));
     }
 
     console.log(`Creating tab resource pool, capacity: ${this.options.poolSize}...`);
     for (let i = 0; i < this.options.poolSize; i++) {
       const page = await this.context.newPage();
+      if (extensionPath && !i)
+        await waitForVpnConnection(page);
       const emitter = new EventEmitter();
 
       await page.exposeFunction('__pushChunk', (delta: string) => {

@@ -4,7 +4,8 @@
   "type": "module",
   "main": "dist",
   "files": [
-    "dist"
+    "dist",
+    "proton_vpn"
   ],
   "scripts": {
     "build": "node build.ts",

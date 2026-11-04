@@ -8,7 +8,7 @@ import type {
   PageWorker,
   ChatExecutionResult,
   OpenAiTool,
-} from './types.ts';
+} from './types.js';
 
 export interface ParsedMcpMetadata {
   serverName: string;
@@ -59,9 +59,6 @@ export abstract class WebAiProvider {
     return { serverName, toolName, description: desc, params };
   }
 
-  /**
-   * 組合首輪上傳的 System Prompt 與 MCP Tools 規範檔案（切換為 @use_mcp_tool JSON 格式）
-   */
   protected buildToolsAndSystemFileContent(systemPrompt = '', tools?: OpenAiTool[]): string {
     let content = `# SYSTEM INSTRUCTIONS & ENVIRONMENT\n\n${systemPrompt.trim()}\n\n`;
 
@@ -71,7 +68,7 @@ export abstract class WebAiProvider {
       content += `## Universal Tool Calling Format (STRICT REQUIREMENT)\n`;
       content += `When you need to call any tool below, you MUST output a single JSON object prefixed with @use_mcp_tool directly in plain text.\n`;
       content += `CRITICAL: NEVER wrap @use_mcp_tool in markdown code blocks (\`\`\`json or \`\`\`).\n`;
-      content += `CRITICAL: Output MUST start immediately with @use_mcp_tool followed by the JSON payload.\n\n`;
+      content += `CRITICAL: If you need to invoke a tool, output @use_mcp_tool directly without intermediate thinking filler in the final text.\n\n`;
       content += `Format Structure:\n`;
       content += `@use_mcp_tool{"server_name":"EXACT_SERVER_NAME_FROM_DEFINITION","tool_name":"EXACT_TOOL_NAME_FROM_DEFINITION","arguments":{"param":"value"}}\n\n`;
       content += `=======================================================\n`;
@@ -91,9 +88,6 @@ export abstract class WebAiProvider {
     return content;
   }
 
-  /**
-   * 多輪接續時格式化工具執行結果
-   */
   protected formatContinuationPrompt(messages: ChatMessage[]): string {
     const trailingToolMessages: ChatMessage[] = [];
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -107,7 +101,8 @@ export abstract class WebAiProvider {
     if (trailingToolMessages.length > 0) {
       let prompt = '[Tool Execution Result]:\n';
       for (const tm of trailingToolMessages) {
-        prompt += `\n[Tool Output Data]:\n${tm.content}\n`;
+        const contentStr = typeof tm.content === 'string' ? tm.content : JSON.stringify(tm.content);
+        prompt += `\n[Tool Output Data]:\n${contentStr}\n`;
       }
       prompt += '\nPlease proceed with the task based on the above tool execution results. If you need to invoke another tool, strictly output @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}}; if the task is complete, summarize and explain to the user directly.';
       return prompt;
@@ -135,9 +130,6 @@ export abstract class WebAiProvider {
     return parsedToolName;
   }
 
-  /**
-   * 解析 @use_mcp_tool{...} JSON 格式，並自內容中剝除工具呼叫字串
-   */
   public extractToolCalls(
     fullText: string,
     tools?: OpenAiTool[]
@@ -154,13 +146,21 @@ export abstract class WebAiProvider {
         break;
       }
 
-      // 保留標記之前的純文字
       cleanContent += fullText.slice(cursor, markerIdx);
 
-      // 尋找 JSON 開頭的左括號 {
       let braceStart = markerIdx + marker.length;
-      while (braceStart < fullText.length && /\s/.test(fullText[braceStart])) {
+      while (braceStart < fullText.length && /[\s:]/.test(fullText[braceStart])) {
         braceStart++;
+      }
+
+      if (fullText.slice(braceStart).startsWith('```')) {
+        const fenceEnd = fullText.indexOf('\n', braceStart);
+        if (fenceEnd !== -1) {
+          braceStart = fenceEnd + 1;
+          while (braceStart < fullText.length && /[\s:]/.test(fullText[braceStart])) {
+            braceStart++;
+          }
+        }
       }
 
       if (braceStart >= fullText.length || fullText[braceStart] !== '{') {
@@ -168,7 +168,6 @@ export abstract class WebAiProvider {
         continue;
       }
 
-      // 括號深度計數器（支援字串轉義與巢狀物件）
       let depth = 0;
       let inString = false;
       let escape = false;
@@ -206,7 +205,6 @@ export abstract class WebAiProvider {
       }
 
       if (braceEnd === -1) {
-        // 未閉合的 JSON，推進游標避免死循環
         cursor = braceStart + 1;
         continue;
       }
@@ -214,19 +212,33 @@ export abstract class WebAiProvider {
       const jsonStr = fullText.slice(braceStart, braceEnd + 1);
       cursor = braceEnd + 1;
 
+      if (fullText.slice(cursor).trimStart().startsWith('```')) {
+        const closeFence = fullText.indexOf('```', cursor);
+        if (closeFence !== -1) {
+          cursor = closeFence + 3;
+        }
+      }
+
       try {
-        // 修復 Windows 路徑單反斜線
-        const sanitizedJson = jsonStr.replace(/([^\\])\\([^\/"\\bfnrtu])/g, '$1/$2');
+        const sanitizedJson = jsonStr.replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, '/');
         const parsed = JSON.parse(sanitizedJson) as Record<string, unknown>;
 
-        const toolNameRaw = typeof parsed.tool_name === 'string' ? parsed.tool_name : '';
+        const toolNameRaw = (
+          typeof parsed.tool_name === 'string'
+            ? parsed.tool_name
+            : typeof parsed.name === 'string'
+            ? parsed.name
+            : ''
+        ).trim();
+
         const resolvedName = this.resolveExactToolName(toolNameRaw, tools);
 
         let argsPayload = '{}';
-        if (typeof parsed.arguments === 'object' && parsed.arguments !== null) {
-          argsPayload = JSON.stringify(parsed.arguments);
-        } else if (typeof parsed.arguments === 'string') {
-          argsPayload = parsed.arguments;
+        const rawArgs = parsed.arguments ?? parsed.parameters ?? parsed.args;
+        if (typeof rawArgs === 'object' && rawArgs !== null) {
+          argsPayload = JSON.stringify(rawArgs);
+        } else if (typeof rawArgs === 'string') {
+          argsPayload = rawArgs;
         }
 
         toolCalls.push({
@@ -277,34 +289,60 @@ export abstract class WebAiProvider {
         promptToSend = this.formatContinuationPrompt(messages);
       }
 
-      console.log(`[${this.name}] Worker #${worker.id} sending message (${isNewConversation ? 'new session' : 'continuation'}): "${promptToSend.substring(0, 50).replace(/\n/g, ' ')}..."`);
+      console.log(
+        `[${this.name}] Worker #${worker.id} sending message (${
+          isNewConversation ? 'new session' : 'continuation'
+        }): "${promptToSend.substring(0, 50).replace(/\n/g, ' ')}..."`
+      );
 
       let accumulatedRaw = '';
       let streamedLength = 0;
+      const PREFIX_TRIGGER = '@use_mcp';
+      const PREFIX_LOWER = PREFIX_TRIGGER.toLowerCase();
 
-      // 即時串流過濾：一旦偵測到 @use_mcp_tool 立即扣住，防止打字機洩漏工具 JSON 到畫面上
       const handleRawChunk = (delta: string) => {
         accumulatedRaw += delta;
         if (!onTextDelta) return;
 
-        const toolTagIdx = accumulatedRaw.search(/@use_mcp_tool/i);
-        if (toolTagIdx === -1) {
-          const chunkToSend = accumulatedRaw.slice(streamedLength);
-          if (chunkToSend) {
-            streamedLength = accumulatedRaw.length;
-            onTextDelta(chunkToSend);
-          }
-        } else {
+        const lowerRaw = accumulatedRaw.toLowerCase();
+        const toolTagIdx = lowerRaw.indexOf(PREFIX_LOWER);
+
+        if (toolTagIdx !== -1) {
           if (streamedLength < toolTagIdx) {
             const chunkToSend = accumulatedRaw.slice(streamedLength, toolTagIdx);
             streamedLength = toolTagIdx;
             if (chunkToSend) onTextDelta(chunkToSend);
           }
+          return;
+        }
+
+        let matchPrefixLen = 0;
+        const maxCheck = Math.min(accumulatedRaw.length, PREFIX_TRIGGER.length - 1);
+        for (let len = maxCheck; len >= 1; len--) {
+          if (lowerRaw.endsWith(PREFIX_LOWER.slice(0, len))) {
+            matchPrefixLen = len;
+            break;
+          }
+        }
+
+        const safeEnd = accumulatedRaw.length - matchPrefixLen;
+        if (safeEnd > streamedLength) {
+          const chunkToSend = accumulatedRaw.slice(streamedLength, safeEnd);
+          streamedLength = safeEnd;
+          if (chunkToSend) onTextDelta(chunkToSend);
         }
       };
 
       const { rawText, currentPath } = await this.sendPromptAndObserve(worker, promptToSend, handleRawChunk);
       const { cleanContent, toolCalls } = this.extractToolCalls(rawText, tools);
+
+      if (onTextDelta && toolCalls.length === 0 && streamedLength < cleanContent.length) {
+        const remainingChunk = cleanContent.slice(streamedLength);
+        if (remainingChunk && !/@use_mcp/i.test(remainingChunk)) {
+          onTextDelta(remainingChunk);
+          streamedLength = cleanContent.length;
+        }
+      }
 
       return {
         rawText,

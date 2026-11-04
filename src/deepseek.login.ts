@@ -4,11 +4,11 @@ import readline from 'readline';
 const DEEPSEEK_URL = 'https://chat.deepseek.com/';
 
 export async function runLoginFlow(profilePath: string): Promise<void> {
-  console.log('[DeepSeek Login] Launching Chrome window with persistent profile...');
+  console.log('[DeepSeek Login] Launching Chromium window with persistent profile...');
 
   const context = await chromium.launchPersistentContext(profilePath, {
     headless: false,
-    channel: 'chrome',
+    channel: 'chromium',
     viewport: { width: 1280, height: 800 },
     args: ['--disable-blink-features=AutomationControlled'],
   });
@@ -25,18 +25,10 @@ export async function runLoginFlow(profilePath: string): Promise<void> {
   console.log('4. Return to this terminal and press Enter to save the session and exit.');
   console.log('======================================================\n');
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  await new Promise<void>((resolve) => {
-    rl.question('Press Enter after completing login: ', () => {
-      resolve();
-    });
-  });
-
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  await new Promise((resolve) => rl.question('Press Enter after completing login: ', resolve));
   rl.close();
+
   await context.close();
   console.log(`[DeepSeek Login] Session successfully saved to: ${profilePath}`);
 }

@@ -2,12 +2,11 @@ import { chromium } from 'playwright';
 import readline from 'readline';
 
 export async function runLoginFlow(profilePath: string): Promise<void> {
-  console.log('[Gemini Login] Launching Chrome window with persistent profile...');
+  console.log('[Gemini Login] Launching Chromium window with persistent profile...');
 
-  // 使用持久化目錄啟動真實 Chrome 視窗
   const context = await chromium.launchPersistentContext(profilePath, {
     headless: false,
-    channel: 'chrome', // 調用本機安裝的真實 Google Chrome，避開 Google 的 bot 阻擋
+    channel: 'chromium',
     viewport: { width: 1280, height: 800 },
     args: ['--disable-blink-features=AutomationControlled'],
   });
@@ -24,7 +23,6 @@ export async function runLoginFlow(profilePath: string): Promise<void> {
   console.log('4. Return to this terminal and press Enter to save the session and exit.');
   console.log('======================================================\n');
 
-  // 等待終端機確認
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   await new Promise((resolve) => rl.question('Press Enter after completing login: ', resolve));
   rl.close();

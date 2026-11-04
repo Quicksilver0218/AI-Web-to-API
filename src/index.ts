@@ -1,31 +1,41 @@
 #!/usr/bin/env node
 import readline from 'readline';
 import path from 'path';
+import { runLoginFlow as runAiStudioLogin } from './ai-studio.login.js';
 import { runLoginFlow as runGeminiLogin } from './gemini.login.js';
 import { runLoginFlow as runDeepseekLogin } from './deepseek.login.js';
 import { DeepSeekProvider } from './deepseek.provider.js';
 import { GeminiProvider } from './gemini.provider.js';
 import { startServer, type ProviderSelection } from './server.js';
+import { AiStudioProvider } from './ai-studio.provider.js';
 
 export interface ProviderOption extends ProviderSelection {
-  id: 'gemini' | 'deepseek';
-  runLoginFlow: (path: string) => Promise<void>;
+  id: string;
+  runLoginFlow: (path: string, extensionPath?: string) => Promise<void>;
 }
 
 const AVAILABLE_PROVIDERS: ProviderOption[] = [
   {
-    id: 'gemini',
-    label: 'Google Gemini (Web)',
-    provider: new GeminiProvider(),
-    profilePath: 'gemini_profile',
-    runLoginFlow: runGeminiLogin,
-  },
-  {
     id: 'deepseek',
-    label: 'DeepSeek Chat (Web)',
+    label: 'DeepSeek Chat',
     provider: new DeepSeekProvider(),
     profilePath: 'deepseek_profile',
     runLoginFlow: runDeepseekLogin,
+  },
+  {
+    id: 'ai_studio',
+    label: 'Google AI Studio',
+    provider: new AiStudioProvider(),
+    profilePath: 'ai_studio_profile',
+    runLoginFlow: runAiStudioLogin,
+    extensionPath: '../proton_vpn'
+  },
+  {
+    id: 'gemini',
+    label: 'Google Gemini',
+    provider: new GeminiProvider(),
+    profilePath: 'gemini_profile',
+    runLoginFlow: runGeminiLogin,
   },
 ];
 
@@ -197,7 +207,7 @@ async function promptStartOrLogin(selected: ProviderOption): Promise<void> {
 
   if (choice === 'login') {
     console.log(`[Login] Running login flow for ${label}...`);
-    await selected.runLoginFlow(path.join(import.meta.dirname, selected.profilePath));
+    await selected.runLoginFlow(path.join(import.meta.dirname, selected.profilePath), selected.extensionPath && path.join(import.meta.dirname, selected.extensionPath));
     console.log(`[Login] ${label} login complete.\n`);
   }
 }
@@ -214,7 +224,7 @@ async function main(): Promise<void> {
   console.log(`[Startup] Selected Provider: ${selected.label} (${selected.id})`);
   await promptStartOrLogin(selected);
 
-  await startServer(selected, { port: cli.port, poolSize: cli.poolSize, headless: true });
+  await startServer(selected, { port: cli.port, poolSize: cli.poolSize, headless: false });
 }
 
 main().catch((err: unknown) => {

@@ -14,6 +14,7 @@ export interface ProviderSelection {
   label: string;
   provider: WebAiProvider;
   profilePath: string;
+  extensionPath?: string;
 }
 
 export interface StartServerConfig {
@@ -58,7 +59,7 @@ export async function startServer(
   selected: ProviderSelection,
   config: StartServerConfig,
 ): Promise<void> {
-  const { provider, profilePath } = selected;
+  const { provider, profilePath, extensionPath } = selected;
   const defaultHomePath = new URL(provider.baseUrl).pathname;
 
   console.log(`[Startup] Initializing dedicated tab pool for: ${selected.label}...`);
@@ -70,7 +71,7 @@ export async function startServer(
     initialUrl: provider.baseUrl,
   });
 
-  await pool.init();
+  await pool.init(extensionPath && path.join(import.meta.dirname, extensionPath));
   console.log(`[Startup] ${selected.label} tab pool successfully initialized.`);
 
   const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -98,12 +99,14 @@ export async function startServer(
         }
 
         const taskKey = getTaskFingerprint(messages);
+        
         const hasHistory = messages.some((m) => m.role === 'assistant' || m.role === 'tool');
-        const isNewConversation = !hasHistory || !sessionStore.has(taskKey);
+        const isNewConversation = !hasHistory;
+        
         const targetPath = isNewConversation ? undefined : sessionStore.get(taskKey);
 
         console.log(
-          `[Request] Provider: ${provider.name} | TaskKey: ${taskKey} | IsNewSession: ${isNewConversation} | TargetPath: ${targetPath ?? 'none'}`
+          `[Request] Provider: ${provider.name} | TaskKey: ${taskKey} | IsNewSession: ${isNewConversation} | MessageCount: ${messages.length} | TargetPath: ${targetPath ?? 'none'}`
         );
 
         const isStream = body.stream === true;
