@@ -22,7 +22,7 @@ export async function runLoginFlow(profilePath: string, extensionPath?: string):
   const existingPages = context.pages();
   const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
 
-  await waitForVpnConnection(page);
+  await waitForVpnConnection(page, 0);
 
   await page.goto(AISTUDIO_URL, { waitUntil: 'domcontentloaded' });
 

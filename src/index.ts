@@ -6,8 +6,9 @@ import { runLoginFlow as runGeminiLogin } from './gemini.login.js';
 import { runLoginFlow as runDeepseekLogin } from './deepseek.login.js';
 import { DeepSeekProvider } from './deepseek.provider.js';
 import { GeminiProvider } from './gemini.provider.js';
-import { startServer, type ProviderSelection } from './server.js';
+import { startServer, type ProviderSelection, type StartServerConfig } from './server.js';
 import { AiStudioProvider } from './ai-studio.provider.js';
+import { BROWSER_DATA_PATH } from './utils.js';
 
 export interface ProviderOption extends ProviderSelection {
   id: string;
@@ -19,14 +20,12 @@ const AVAILABLE_PROVIDERS: ProviderOption[] = [
     id: 'deepseek',
     label: 'DeepSeek Chat',
     provider: new DeepSeekProvider(),
-    profilePath: 'deepseek_profile',
     runLoginFlow: runDeepseekLogin,
   },
   {
     id: 'ai_studio',
     label: 'Google AI Studio',
     provider: new AiStudioProvider(),
-    profilePath: 'ai_studio_profile',
     runLoginFlow: runAiStudioLogin,
     extensionPath: '../proton_vpn'
   },
@@ -34,7 +33,6 @@ const AVAILABLE_PROVIDERS: ProviderOption[] = [
     id: 'gemini',
     label: 'Google Gemini',
     provider: new GeminiProvider(),
-    profilePath: 'gemini_profile',
     runLoginFlow: runGeminiLogin,
   },
 ];
@@ -43,15 +41,11 @@ const AVAILABLE_PROVIDERS: ProviderOption[] = [
 // CLI parsing
 // ---------------------------------------------------------------------------
 
-interface CliConfig {
-  port: number;
-  poolSize: number;
-}
-
-function parseArgs(argv: string[]): CliConfig {
-  const config: CliConfig = {
+function parseArgs(argv: string[]): StartServerConfig {
+  const config: StartServerConfig = {
     port: Number(process.env.PORT) || 5000,
     poolSize: Number(process.env.POOL_SIZE) || 2,
+    headless: true,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -63,6 +57,9 @@ function parseArgs(argv: string[]): CliConfig {
         break;
       case '--pool-size':
         config.poolSize = Number(argv[++i]);
+        break;
+      case '--headful':
+        config.headless = false;
         break;
       case '-h':
       case '--help':
@@ -82,11 +79,12 @@ function parseArgs(argv: string[]): CliConfig {
 }
 
 function printHelp(): void {
-  console.log('Usage: tsx index.ts [options]');
+  console.log('Usage: npx --allow-git all -y github:Quicksilver0218/AI-Web-to-API [options]');
   console.log('');
   console.log('Options:');
-  console.log('  -p, --port <number>     Port to listen on (default: 5000)');
+  console.log('  -p, --port <number>      Port to listen on (default: 5000)');
   console.log('  --pool-size <number>     Number of browser tabs in the pool (default: 2)');
+  console.log('  --headful                Run in headful mode (default: headless)');
   console.log('  -h, --help               Display this help message');
 }
 
@@ -170,7 +168,7 @@ async function promptStartOrLogin(selected: ProviderOption): Promise<void> {
 
       options.forEach((item, idx) => {
         if (idx === selectedIndex) {
-          console.log(` \x1b[36m> [x] ${item.label}\x1b[0m`);
+          console.log(` \x1b[36m> [o] ${item.label}\x1b[0m`);
         } else {
           console.log(`   [ ] ${item.label}`);
         }
@@ -207,7 +205,7 @@ async function promptStartOrLogin(selected: ProviderOption): Promise<void> {
 
   if (choice === 'login') {
     console.log(`[Login] Running login flow for ${label}...`);
-    await selected.runLoginFlow(path.join(import.meta.dirname, selected.profilePath), selected.extensionPath && path.join(import.meta.dirname, selected.extensionPath));
+    await selected.runLoginFlow(BROWSER_DATA_PATH, selected.extensionPath && path.join(import.meta.dirname, selected.extensionPath));
     console.log(`[Login] ${label} login complete.\n`);
   }
 }
@@ -217,14 +215,14 @@ async function promptStartOrLogin(selected: ProviderOption): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const cli = parseArgs(process.argv.slice(2));
+  const config = parseArgs(process.argv.slice(2));
 
   const selected = await promptProviderSelection();
 
   console.log(`[Startup] Selected Provider: ${selected.label} (${selected.id})`);
   await promptStartOrLogin(selected);
 
-  await startServer(selected, { port: cli.port, poolSize: cli.poolSize, headless: false });
+  await startServer(selected, config);
 }
 
 main().catch((err: unknown) => {

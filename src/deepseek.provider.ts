@@ -3,12 +3,13 @@ import { WebAiProvider } from './web-ai-provider.js';
 import type { PageWorker, WindowWithCustomEvents } from './types.ts';
 
 interface WaitForResponseParams {
-  selector: string;
-  prevCount: number;
+  prevMaxKey: number;
 }
 
 interface ObserveStreamParams {
-  selector: string;
+  itemSelector: string;
+  thinkSelector: string;
+  prevMaxKey: number;
 }
 
 export class DeepSeekProvider extends WebAiProvider {
@@ -19,10 +20,53 @@ export class DeepSeekProvider extends WebAiProvider {
     PROMPT_INPUT: 'textarea#chat-input, textarea[placeholder*="DeepSeek"], textarea',
     FILE_INPUT: 'input[type="file"]',
     UPLOAD_BUTTON: 'div[role="button"]:has(svg), button:has(svg)',
-    SEND_BUTTON: 'div[role="button"]:has(svg):not([aria-disabled="true"]), button:has(svg):not([disabled]), div[class*="send-button"]',
-    RESPONSE_CONTAINER: '.ds-markdown:not(.ds-think-content .ds-markdown)',
-    VIRTUAL_LIST_ITEM: '.ds-virtual-list-visible-items [data-virtual-list-item-key]',
+    SEND_BUTTON:
+      'div[role="button"]:has(svg):not([aria-disabled="true"]), button:has(svg):not([disabled]), div[class*="send-button"]',
+    DEEPTHINK_BUTTON:
+      '.ds-toggle-button:has-text("深度思考"), .ds-toggle-button:has-text("DeepThink")',
+    RATE_LIMIT_RETRY_BUTTON:
+      '.ds-button--warning, div[role="button"].ds-button--warning',
+    RESPONSE_CONTAINER: '.ds-markdown.ds-assistant-message-main-content, .ds-markdown:not(.ds-think-content *):not(.ds-think *)',
+    THINK_CONTAINER: '.ds-think-content, .ds-think, [class*="think-content"]',
+    VIRTUAL_LIST_ITEM: '[data-virtual-list-item-key]',
   } as const;
+
+  /**
+   * 根據 thinking Header 切換深度思考 (DeepThink / R1)
+   */
+  public async setDeepThinkState(page: Page, enable: boolean): Promise<void> {
+    try {
+      const toggleLocator = page.locator(this.selectors.DEEPTHINK_BUTTON).first();
+
+      if (await toggleLocator.isVisible({ timeout: 2500 })) {
+        const ariaPressed = await toggleLocator.getAttribute('aria-pressed');
+        const isActive = ariaPressed === 'true';
+
+        console.log(`[DeepSeek] DeepThink Toggle: currently active=${isActive}, target enable=${enable}`);
+
+        if (enable && !isActive) {
+          console.log('[DeepSeek] -> Clicking to ENABLE DeepThink...');
+          await toggleLocator.scrollIntoViewIfNeeded().catch(() => {});
+          await toggleLocator.click({ timeout: 2000 });
+
+          const afterPressed = await toggleLocator.getAttribute('aria-pressed');
+          if (afterPressed !== 'true') {
+            await toggleLocator.click({ force: true, timeout: 2000 }).catch(() => {});
+          }
+        } else if (!enable && isActive) {
+          console.log('[DeepSeek] -> Clicking to DISABLE DeepThink...');
+          await toggleLocator.scrollIntoViewIfNeeded().catch(() => {});
+          await toggleLocator.click({ timeout: 2000 });
+        } else {
+          console.log(`[DeepSeek] DeepThink already in target state.`);
+        }
+      } else {
+        console.warn('[DeepSeek] Could not locate .ds-toggle-button:has-text("深度思考")');
+      }
+    } catch (err) {
+      console.warn('[DeepSeek] setDeepThinkState warning:', err);
+    }
+  }
 
   async uploadFile(page: Page, filePath: string): Promise<void> {
     console.log(`[DeepSeek] Uploading attachment file: ${filePath}`);
@@ -40,7 +84,6 @@ export class DeepSeekProvider extends WebAiProvider {
       await fileChooser.setFiles(filePath);
     }
 
-    await page.waitForTimeout(2500);
     console.log('[DeepSeek] Attachment uploaded and parsed.');
   }
 
@@ -64,99 +107,264 @@ export class DeepSeekProvider extends WebAiProvider {
   }
 
   /**
-   * Helper function to calculate current response turn count from virtual list keys
+   * 獲取目前 DOM 中最大的 data-virtual-list-item-key，用於鎖定全新訊息回合
    */
-  private async getVirtualResponseCount(page: Page): Promise<number> {
+  private async getMaxVirtualKey(page: Page): Promise<number> {
     return await page.evaluate((selector: string) => {
       const elements = Array.from(document.querySelectorAll(selector));
-      const maxKey = elements.reduce((max: number, element: Element) => {
+      return elements.reduce((max: number, element: Element) => {
         const rawKey = element.getAttribute('data-virtual-list-item-key');
-        const num = rawKey !== null ? Number(rawKey) : 0;
+        const num = rawKey !== null ? Number(rawKey) : -1;
         return Number.isNaN(num) ? max : Math.max(num, max);
-      }, 0);
-
-      return maxKey / 2;
+      }, -1);
     }, this.selectors.VIRTUAL_LIST_ITEM);
   }
 
   async sendPromptAndObserve(
     worker: PageWorker,
     prompt: string,
-    onRawChunk: (delta: string) => void
+    onRawChunk: (delta: string, isReasoning?: boolean) => void,
+    options?: { thinkingLevel?: string }
   ): Promise<{ rawText: string; currentPath: string }> {
     const { page, emitter, id } = worker;
+
+    const normalizedEffort = (options?.thinkingLevel ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/[-_]/g, '');
+
+    const shouldEnableDeepThink = ['medium', 'high', 'xhigh', 'extrahigh'].includes(normalizedEffort);
+
+    console.log(
+      `[DeepSeek] Worker #${id} received effort: "${options?.thinkingLevel ?? 'none'}" -> DeepThink: ${shouldEnableDeepThink}`
+    );
+
+    await this.setDeepThinkState(page, shouldEnableDeepThink);
 
     const input = page.locator(this.selectors.PROMPT_INPUT).first();
     await input.waitFor({ state: 'visible', timeout: 15000 });
 
-    const prevCount = await this.getVirtualResponseCount(page);
-    console.log(`[DeepSeek] Worker #${id} current response count before prompt: ${prevCount}`);
+    // 記錄發送前的最大 key，確保稍後只監聽比此 key 更大的全新回合
+    const prevMaxKey = await this.getMaxVirtualKey(page);
+    console.log(`[DeepSeek] Worker #${id} max virtual list key before prompt: ${prevMaxKey}`);
 
     await input.click();
     await input.fill(prompt);
     await input.dispatchEvent('input');
-    await page.waitForTimeout(300);
 
-    const sendBtn = page.locator(this.selectors.SEND_BUTTON).last();
-    let sent = false;
-    if (await sendBtn.isVisible()) {
-      try {
-        await sendBtn.click({ timeout: 2000 });
-        sent = true;
-      } catch {
-        // Fall back to keypress if button click is obstructed
+    const submitPrompt = async () => {
+      const sendBtn = page.locator(this.selectors.SEND_BUTTON).last();
+      let sent = false;
+      if (await sendBtn.isVisible()) {
+        try {
+          await sendBtn.click({ timeout: 2000 });
+          sent = true;
+        } catch {
+          // Fall back
+        }
+      }
+      if (!sent) {
+        await input.press('Enter');
+      }
+    };
+
+    await submitPrompt();
+
+    // 頻率限制與新回應等待防護
+    const maxRateLimitRetries = 5;
+    for (let attempt = 1; attempt <= maxRateLimitRetries; attempt++) {
+      const waitStatus = await page
+        .waitForFunction(
+          ({ prevMaxKey }: WaitForResponseParams) => {
+            // 1. 檢查頻率限制報錯
+            const warningBtn = document.querySelector('.ds-button--warning');
+            const hasErrorText = (document.body.innerText || '').includes('消息发送过于频繁');
+            if (warningBtn || hasErrorText) {
+              return 'rate_limit';
+            }
+
+            // 2. 檢查是否有 key > prevMaxKey 的新助理回合掛載（帶有思考或主要回答）
+            const elements = Array.from(document.querySelectorAll('[data-virtual-list-item-key]'));
+            for (const el of elements) {
+              const k = Number(el.getAttribute('data-virtual-list-item-key') || '-1');
+              if (k > prevMaxKey) {
+                if (el.querySelector('.ds-think-content, .ds-think, .ds-assistant-message-main-content, .ds-loading, .ds-cursor')) {
+                  return 'success';
+                }
+              }
+            }
+
+            // 3. 檢查 Stop 按鈕是否已在運行中
+            const stopBtn = document.querySelector(
+              'div[role="button"]:has(svg rect), button:has(svg rect), [aria-label*="Stop" i], [aria-label*="停止" i], .ds-stop-button'
+            );
+            if (stopBtn && (stopBtn as HTMLElement).offsetParent !== null) {
+              return 'success';
+            }
+
+            return false;
+          },
+          { prevMaxKey },
+          { timeout: 8000 }
+        )
+        .catch(() => null);
+
+      const status = waitStatus ? await waitStatus.jsonValue() : null;
+
+      if (status === 'rate_limit') {
+        console.warn(
+          `[DeepSeek] Worker #${id} 遇到錯誤「消息发送过于频繁，请稍后重试」。等待 2 秒後重試 (${attempt}/${maxRateLimitRetries})...`
+        );
+        await page.waitForTimeout(2000);
+
+        const retryBtn = page.locator(this.selectors.RATE_LIMIT_RETRY_BUTTON).last();
+        if (await retryBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+          console.log(`[DeepSeek] Worker #${id} 點擊重試按鈕 (.ds-button--warning)...`);
+          await retryBtn.click();
+        } else {
+          console.log(`[DeepSeek] Worker #${id} 重新嘗試送出提示詞...`);
+          await submitPrompt();
+        }
+
+        continue;
+      }
+
+      if (status === 'success') {
+        break;
       }
     }
-    if (!sent) {
-      await input.press('Enter');
-    }
 
-    await page.waitForFunction(
-      ({ selector, prevCount }: WaitForResponseParams) => {
-        const elements = Array.from(document.querySelectorAll(selector));
-        const maxKey = elements.reduce((max: number, element: Element) => {
-          const rawKey = element.getAttribute('data-virtual-list-item-key');
-          const num = rawKey !== null ? Number(rawKey) : 0;
-          return Number.isNaN(num) ? max : Math.max(num, max);
-        }, 0);
+    console.log(`[DeepSeek] Worker #${id} new response generation initiated.`);
 
-        return maxKey / 2 > prevCount;
-      },
-      { selector: this.selectors.VIRTUAL_LIST_ITEM, prevCount }
-    );
+    let rawFullMainText = '';
 
-    const newCount = await this.getVirtualResponseCount(page);
-    console.log(`[DeepSeek] Worker #${id} new response detected. Turn count updated to: ${newCount}`);
+    const chunkListener = (rawPayload: string) => {
+      let type: 'reasoning' | 'content' = 'content';
+      let delta = rawPayload;
 
-    let rawFullText = '';
-    const chunkListener = (delta: string) => {
-      rawFullText += delta;
-      onRawChunk(delta);
+      try {
+        if (typeof rawPayload === 'string' && rawPayload.startsWith('{"type":')) {
+          const parsed = JSON.parse(rawPayload);
+          type = parsed.type;
+          delta = parsed.delta;
+        }
+      } catch {
+        // Fallback
+      }
+
+      if (type === 'reasoning') {
+        onRawChunk(delta, true);
+      } else {
+        rawFullMainText += delta;
+        onRawChunk(delta, false);
+      }
     };
     emitter.on('chunk', chunkListener);
 
-    let finalExtractedText = '';
+    let finalMainText = '';
 
     try {
-      finalExtractedText = await page.evaluate(
-        ({ selector }: ObserveStreamParams) => {
+      finalMainText = await page.evaluate(
+        ({ itemSelector, thinkSelector, prevMaxKey }: ObserveStreamParams) => {
           return new Promise<string>((resolve) => {
             const customWindow = window as unknown as WindowWithCustomEvents;
 
-            function getLatestContainer(): HTMLElement | null {
-              const elements = document.querySelectorAll(selector);
+            // 嚴格只認 key > prevMaxKey 的新助理節點，絕不回退到舊回合！
+            function getLatestTurnRoot(): HTMLElement | null {
+              const elements = Array.from(document.querySelectorAll(itemSelector)) as HTMLElement[];
               if (elements.length === 0) return null;
-              return elements[elements.length - 1] as HTMLElement;
+
+              // 篩選屬於本輪對話的新節點
+              const newItems = elements.filter((el) => {
+                const k = Number(el.getAttribute('data-virtual-list-item-key') || '-1');
+                return k > prevMaxKey;
+              });
+
+              if (newItems.length === 0) return null;
+
+              // 在新節點中找出含有助理內容（思考、回答或 loading 標記）的項目
+              const newAssistant = newItems.filter((el) => {
+                return (
+                  el.querySelector(
+                    '.ds-think-content, .ds-think, .ds-assistant-message-main-content, .ds-loading, .ds-cursor'
+                  ) !== null
+                );
+              });
+
+              if (newAssistant.length > 0) {
+                newAssistant.sort((a, b) => {
+                  const keyA = Number(a.getAttribute('data-virtual-list-item-key') || '-1');
+                  const keyB = Number(b.getAttribute('data-virtual-list-item-key') || '-1');
+                  return keyA - keyB;
+                });
+                return newAssistant[newAssistant.length - 1];
+              }
+
+              // 若剛掛載尚未渲染出子標籤，先取新節點中的最後一項
+              return newItems[newItems.length - 1];
             }
 
-            // ================= 核心策略 1：從 React Fiber 直接取回未污染的原始 Markdown =================
-            function getReactRawMarkdown(container: HTMLElement | null): string | null {
+            function isDeepSeekRunning(): boolean {
+              const stopBtn = document.querySelector(
+                'div[role="button"]:has(svg rect), button:has(svg rect), [aria-label*="Stop" i], [aria-label*="停止" i], .ds-stop-button'
+              );
+              if (stopBtn && (stopBtn as HTMLElement).offsetParent !== null) {
+                return true;
+              }
+
+              const loadingEl = document.querySelector(
+                '.ds-loading, .ds-cursor, [class*="loading"], [class*="streaming"]'
+              );
+              if (loadingEl && (loadingEl as HTMLElement).offsetParent !== null) {
+                return true;
+              }
+
+              return false;
+            }
+
+            function hasCompleteToolCall(raw: string): boolean {
+              const markerIdx = raw.indexOf('@use_mcp_tool');
+              if (markerIdx === -1) return false;
+
+              const braceStart = raw.indexOf('{', markerIdx);
+              if (braceStart === -1) return false;
+
+              let depth = 0;
+              let inString = false;
+              let escape = false;
+
+              for (let i = braceStart; i < raw.length; i++) {
+                const char = raw[i];
+                if (escape) {
+                  escape = false;
+                  continue;
+                }
+                if (char === '\\') {
+                  escape = true;
+                  continue;
+                }
+                if (char === '"') {
+                  inString = !inString;
+                  continue;
+                }
+                if (!inString) {
+                  if (char === '{') depth++;
+                  else if (char === '}') {
+                    depth--;
+                    if (depth === 0) return true;
+                  }
+                }
+              }
+              return false;
+            }
+
+            function getReactRawMarkdown(container: HTMLElement | null, isThought = false): string | null {
               if (!container) return null;
-              const targets = [
+
+              const targets: (HTMLElement | null)[] = [
                 container,
+                container.querySelector('.ds-markdown'),
                 container.parentElement,
-                container.closest('.ds-markdown'),
-                container.closest('[data-virtual-list-item-key]'),
               ];
 
               for (const el of targets) {
@@ -171,17 +379,32 @@ export class DeepSeekProvider extends WebAiProvider {
                 while (fiber && depth < 25) {
                   const props = fiber.memoizedProps;
                   if (props) {
-                    if (typeof props.content === 'string' && props.content.trim().length > 0) {
-                      return props.content;
-                    }
-                    if (typeof props.text === 'string' && props.text.trim().length > 0) {
-                      return props.text;
-                    }
-                    if (typeof props.rawContent === 'string' && props.rawContent.trim().length > 0) {
-                      return props.rawContent;
-                    }
-                    if (props.message && typeof props.message.content === 'string' && props.message.content.trim().length > 0) {
-                      return props.message.content;
+                    if (isThought) {
+                      if (typeof props.thinking_content === 'string' && props.thinking_content.trim().length > 0) {
+                        return props.thinking_content;
+                      }
+                      if (typeof props.reasoning_content === 'string' && props.reasoning_content.trim().length > 0) {
+                        return props.reasoning_content;
+                      }
+                      if (typeof props.content === 'string' && props.content.trim().length > 0) {
+                        return props.content;
+                      }
+                      if (typeof props.text === 'string' && props.text.trim().length > 0) {
+                        return props.text;
+                      }
+                    } else {
+                      if (typeof props.content === 'string' && props.content.trim().length > 0) {
+                        return props.content;
+                      }
+                      if (typeof props.text === 'string' && props.text.trim().length > 0) {
+                        return props.text;
+                      }
+                      if (typeof props.rawContent === 'string' && props.rawContent.trim().length > 0) {
+                        return props.rawContent;
+                      }
+                      if (props.message && typeof props.message.content === 'string' && props.message.content.trim().length > 0) {
+                        return props.message.content;
+                      }
                     }
                   }
                   fiber = fiber.return;
@@ -191,34 +414,28 @@ export class DeepSeekProvider extends WebAiProvider {
               return null;
             }
 
-            // ================= 核心策略 2：全節點 DOM 逆向解析器（降級防線） =================
             function domToMarkdownFallback(container: HTMLElement | null): string {
               if (!container) return '';
               const clone = container.cloneNode(true) as HTMLElement;
 
-              // 移除滾動條陰影等干擾節點
-              clone.querySelectorAll('.ds-scroll-area__gutters, [class*="gutter"]').forEach((el) => el.remove());
+              clone.querySelectorAll('.ds-scroll-area__gutters, [class*="gutter"], button, .actions').forEach((el) => el.remove());
 
-              // 還原 KaTeX 公式
               clone.querySelectorAll('.katex').forEach((katex) => {
                 const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
                 const rawTex = annotation?.textContent ?? '';
                 katex.replaceWith(document.createTextNode(`$${rawTex}$`));
               });
 
-              // 還原標題（H1-H6）
               clone.querySelectorAll('h1').forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
               clone.querySelectorAll('h2').forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
               clone.querySelectorAll('h3').forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
               clone.querySelectorAll('h4, h5, h6').forEach((h) => h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`)));
 
-              // 還原清單項目
               clone.querySelectorAll('li').forEach((li) => {
                 const text = li.textContent?.trim() ?? '';
                 li.replaceWith(document.createTextNode(`\n- ${text}\n`));
               });
 
-              // 還原段落
               clone.querySelectorAll('p, .ds-markdown-paragraph').forEach((p) => {
                 const text = p.textContent?.trim() ?? '';
                 if (text) {
@@ -226,7 +443,6 @@ export class DeepSeekProvider extends WebAiProvider {
                 }
               });
 
-              // 還原表格
               clone.querySelectorAll('table').forEach((table) => {
                 const rows = Array.from(table.querySelectorAll('tr'));
                 if (rows.length === 0) return;
@@ -264,48 +480,105 @@ export class DeepSeekProvider extends WebAiProvider {
                 table.replaceWith(document.createTextNode(`\n\n${mdRows.join('\n')}\n\n`));
               });
 
-              // 使用 textContent 提取，避免 innerText 的 CSS 樣式坍塌
               const raw = clone.textContent ?? '';
               return raw.replace(/\n{3,}/g, '\n\n').trim();
             }
 
-            function getBestText(): string {
-              const container = getLatestContainer();
-              if (!container) return '';
-              const rawReact = getReactRawMarkdown(container);
+            // 1. 思考提取：嚴格限定在當前新回合 turnRoot 內部
+            function getThoughtText(turnRoot: HTMLElement | null): string {
+              if (!turnRoot) return '';
+              const thinkEl = turnRoot.querySelector(thinkSelector) as HTMLElement | null;
+              if (!thinkEl) return '';
+
+              const rawReact = getReactRawMarkdown(thinkEl, true);
               if (rawReact) return rawReact;
-              return domToMarkdownFallback(container);
+
+              return domToMarkdownFallback(thinkEl);
             }
 
-            let lastLen = 0;
+            // 2. 主回答提取：嚴格限定在當前新回合 turnRoot 內部；思考階段直接回傳空字串，絕不跨回合讀舊資料！
+            function getMainText(turnRoot: HTMLElement | null): string {
+              if (!turnRoot) return '';
+
+              // 優先尋找專屬的主回答容器 class
+              const mainEl = turnRoot.querySelector(
+                '.ds-assistant-message-main-content, .ds-markdown:not(.ds-think-content *):not(.ds-think *)'
+              ) as HTMLElement | null;
+
+              // 關鍵：如果主回答容器尚未生成（表示模型還在深度思考中），絕對不能回退到全局查找舊訊息！
+              if (!mainEl) return '';
+
+              const rawReact = getReactRawMarkdown(mainEl, false);
+              if (rawReact) return rawReact;
+
+              return domToMarkdownFallback(mainEl);
+            }
+
+            let lastThoughtLen = 0;
+            let lastMainLen = 0;
+            let lastChangeTime = Date.now();
             let isDone = false;
-            let stabilityTimer: number | null = null;
 
             function emitDelta() {
-              const currentText = getBestText();
-              if (currentText.length > lastLen) {
-                const delta = currentText.slice(lastLen);
-                lastLen = currentText.length;
-                customWindow.__pushChunk(delta);
+              if (isDone) return;
+              const turn = getLatestTurnRoot();
+              if (!turn) return;
+
+              // 推送 Thinking 專屬通道
+              const currentThought = getThoughtText(turn);
+              if (currentThought.length > lastThoughtLen) {
+                const thoughtDelta = currentThought.slice(lastThoughtLen);
+                lastThoughtLen = currentThought.length;
+                lastChangeTime = Date.now();
+                customWindow.__pushChunk(
+                  JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
+                );
+              }
+
+              // 推送 Content 專屬通道
+              const currentMain = getMainText(turn);
+              if (currentMain.length > lastMainLen) {
+                const mainDelta = currentMain.slice(lastMainLen);
+                lastMainLen = currentMain.length;
+                lastChangeTime = Date.now();
+                customWindow.__pushChunk(
+                  JSON.stringify({ type: 'content', delta: mainDelta })
+                );
               }
             }
 
-            function complete() {
+            async function complete() {
               if (isDone) return;
               isDone = true;
-              emitDelta();
+
               if (observer) observer.disconnect();
-              if (stabilityTimer !== null) clearTimeout(stabilityTimer);
-              customWindow.__pushDone();
-              resolve(getBestText());
+              if (pollInterval !== null) clearInterval(pollInterval);
+
+              const turn = getLatestTurnRoot();
+              const finalThought = getThoughtText(turn);
+              if (finalThought.length > lastThoughtLen) {
+                const thoughtDelta = finalThought.slice(lastThoughtLen);
+                lastThoughtLen = finalThought.length;
+                await customWindow.__pushChunk(
+                  JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
+                );
+              }
+
+              const finalMain = getMainText(turn);
+              if (finalMain.length > lastMainLen) {
+                const mainDelta = finalMain.slice(lastMainLen);
+                lastMainLen = finalMain.length;
+                await customWindow.__pushChunk(
+                  JSON.stringify({ type: 'content', delta: mainDelta })
+                );
+              }
+
+              await customWindow.__pushDone();
+              resolve(finalMain);
             }
 
             const observer = new MutationObserver(() => {
               emitDelta();
-              if (stabilityTimer !== null) clearTimeout(stabilityTimer);
-              stabilityTimer = window.setTimeout(() => {
-                complete();
-              }, 3500);
             });
 
             observer.observe(document.body, {
@@ -314,18 +587,80 @@ export class DeepSeekProvider extends WebAiProvider {
               characterData: true,
             });
 
+            const pollInterval = window.setInterval(() => {
+              if (isDone) return;
+              emitDelta();
+
+              const warningBtn = document.querySelector('.ds-button--warning');
+              const hasErrorText = (document.body.innerText || '').includes('消息发送过于频繁');
+              if ((warningBtn || hasErrorText) && lastThoughtLen === 0 && lastMainLen === 0) {
+                if (observer) observer.disconnect();
+                clearInterval(pollInterval);
+                resolve('__DEEPSEEK_RATE_LIMIT__');
+                return;
+              }
+
+              const turn = getLatestTurnRoot();
+              const currentMain = turn ? getMainText(turn) : '';
+              const running = isDeepSeekRunning();
+
+              // 只有當新回合真正輸出了完整的工具呼叫且 Stop 按鈕消失時，才判定完成
+              if (!running && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
+                void complete();
+                return;
+              }
+
+              const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
+
+              // 思考過渡保護：如果目前只有思考內容而還沒有任何主回答，絕不能草率結束
+              if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1500) {
+                if (lastMainLen === 0) {
+                  const isStillThinking = turn?.querySelector('.ds-loading, .ds-cursor, [class*="loading"]') !== null;
+                  if (isStillThinking) {
+                    return; // 繼續等待主回答生成
+                  }
+                }
+                void complete();
+                return;
+              }
+
+              if (hasGeneratedAny && Date.now() - lastChangeTime > 20000) {
+                void complete();
+                return;
+              }
+            }, 250);
+
             emitDelta();
           });
         },
-        { selector: this.selectors.RESPONSE_CONTAINER }
+        {
+          itemSelector: this.selectors.VIRTUAL_LIST_ITEM,
+          thinkSelector: this.selectors.THINK_CONTAINER,
+          prevMaxKey,
+        }
       );
     } finally {
+      if (finalMainText.length > rawFullMainText.length && finalMainText !== '__DEEPSEEK_RATE_LIMIT__') {
+        const gapRemainder = finalMainText.slice(rawFullMainText.length);
+        onRawChunk(gapRemainder, false);
+        rawFullMainText = finalMainText;
+      }
       emitter.off('chunk', chunkListener);
+    }
+
+    if (finalMainText === '__DEEPSEEK_RATE_LIMIT__') {
+      console.warn(`[DeepSeek] Worker #${id} 觀察初期遭遇頻率限制，等待 2 秒後點擊重試按鈕...`);
+      await page.waitForTimeout(2000);
+      const retryBtn = page.locator(this.selectors.RATE_LIMIT_RETRY_BUTTON).last();
+      if (await retryBtn.isVisible().catch(() => false)) {
+        await retryBtn.click();
+      }
+      return await this.sendPromptAndObserve(worker, prompt, onRawChunk, options);
     }
 
     const currentUrlObj = new URL(page.url());
     const currentPath = currentUrlObj.pathname;
-    const resolvedText = finalExtractedText.trim() ? finalExtractedText : rawFullText;
+    const resolvedText = finalMainText.trim() ? finalMainText : rawFullMainText;
 
     console.log(`[DeepSeek] Worker #${id} generation completed. Current URL path: ${currentPath}`);
     return { rawText: resolvedText, currentPath };

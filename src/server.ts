@@ -3,17 +3,16 @@ import crypto from 'crypto';
 import path from 'path';
 import type {
   ChatMessage,
-  ChatCompletionRequestBody,
   ChatCompletionChunk,
   ChatCompletionResponse,
 } from './types.ts';
 import { WebAiProvider } from './web-ai-provider.js';
 import { PagePool } from './page-pool.js';
+import { BROWSER_DATA_PATH } from './utils.js';
 
 export interface ProviderSelection {
   label: string;
   provider: WebAiProvider;
-  profilePath: string;
   extensionPath?: string;
 }
 
@@ -30,7 +29,7 @@ function getTaskFingerprint(messages: ChatMessage[]): string {
   return crypto.createHash('sha256').update(firstUserMsg).digest('hex').substring(0, 16);
 }
 
-function parseJsonBody(req: IncomingMessage): Promise<ChatCompletionRequestBody> {
+function parseJsonBody(req: IncomingMessage): Promise<Record<string, any>> {
   return new Promise((resolve, reject) => {
     let raw = '';
     req.on('data', (c: Buffer) => {
@@ -38,7 +37,7 @@ function parseJsonBody(req: IncomingMessage): Promise<ChatCompletionRequestBody>
     });
     req.on('end', () => {
       try {
-        const parsed = (raw ? JSON.parse(raw) : {}) as ChatCompletionRequestBody;
+        const parsed = (raw ? JSON.parse(raw) : {}) as Record<string, any>;
         resolve(parsed);
       } catch {
         reject(new Error('Invalid JSON'));
@@ -59,13 +58,13 @@ export async function startServer(
   selected: ProviderSelection,
   config: StartServerConfig,
 ): Promise<void> {
-  const { provider, profilePath, extensionPath } = selected;
+  const { provider, extensionPath } = selected;
   const defaultHomePath = new URL(provider.baseUrl).pathname;
 
   console.log(`[Startup] Initializing dedicated tab pool for: ${selected.label}...`);
 
   const pool = new PagePool({
-    userDataDir: path.join(import.meta.dirname, profilePath),
+    userDataDir: BROWSER_DATA_PATH,
     headless: config.headless,
     poolSize: config.poolSize,
     initialUrl: provider.baseUrl,
@@ -75,9 +74,10 @@ export async function startServer(
   console.log(`[Startup] ${selected.label} tab pool successfully initialized.`);
 
   const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // 允許跨域自訂 thinking Header
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, thinking');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -89,8 +89,8 @@ export async function startServer(
 
     if (req.method === 'POST' && parsedUrl.pathname === '/v1/chat/completions') {
       try {
-        const body = await parseJsonBody(req);
-        const messages = body.messages ?? [];
+        const rawBody = await parseJsonBody(req);
+        const messages = rawBody.messages ?? [];
 
         if (!Array.isArray(messages) || messages.length === 0) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -98,19 +98,20 @@ export async function startServer(
           return;
         }
 
+        // 讀取 Cline 送來的 'thinking' Header (Node.js 會自動轉為全小寫)
+        const rawThinkingHeader = req.headers['thinking'];
+        const thinkingVal = (Array.isArray(rawThinkingHeader) ? rawThinkingHeader[0] : rawThinkingHeader ?? 'medium')
+          .trim()
+          .toLowerCase()
+          .replace(/[-_]/g, '');
+
         const taskKey = getTaskFingerprint(messages);
-        
         const hasHistory = messages.some((m) => m.role === 'assistant' || m.role === 'tool');
         const isNewConversation = !hasHistory;
-        
         const targetPath = isNewConversation ? undefined : sessionStore.get(taskKey);
 
-        console.log(
-          `[Request] Provider: ${provider.name} | TaskKey: ${taskKey} | IsNewSession: ${isNewConversation} | MessageCount: ${messages.length} | TargetPath: ${targetPath ?? 'none'}`
-        );
-
-        const isStream = body.stream === true;
-        const modelName = body.model ?? `${provider.name}-playwright-pool`;
+        const isStream = rawBody.stream === true;
+        const modelName = rawBody.model ?? `${provider.name}-playwright-pool`;
 
         const worker = await pool.acquire();
 
@@ -128,7 +129,27 @@ export async function startServer(
               messages,
               isNewConversation,
               targetPath,
-              tools: body.tools,
+              tools: rawBody.tools,
+              thinkingLevel: thinkingVal,
+              onReasoningDelta: (delta: string) => {
+                const reasoningPayload: ChatCompletionChunk = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: modelName,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        reasoning_content: delta,
+                        reasoning: delta,
+                      } as unknown as ChatCompletionChunk['choices'][0]['delta'],
+                      finish_reason: null,
+                    },
+                  ],
+                };
+                res.write(`data: ${JSON.stringify(reasoningPayload)}\n\n`);
+              },
               onTextDelta: (delta: string) => {
                 const chunkPayload: ChatCompletionChunk = {
                   id: `chatcmpl-${Date.now()}`,
@@ -143,12 +164,9 @@ export async function startServer(
 
             if (result.currentPath && result.currentPath !== defaultHomePath) {
               sessionStore.set(taskKey, result.currentPath);
-              console.log(`[Session Persisted] TaskKey ${taskKey} -> ${result.currentPath}`);
             }
 
             if (result.toolCalls.length > 0) {
-              console.log(`[Dispatching Tool Calls to Cline] Count: ${result.toolCalls.length}`, result.toolCalls);
-
               for (let i = 0; i < result.toolCalls.length; i++) {
                 const tc = result.toolCalls[i];
                 const toolPayload: ChatCompletionChunk = {
@@ -206,12 +224,12 @@ export async function startServer(
               messages,
               isNewConversation,
               targetPath,
-              tools: body.tools,
+              tools: rawBody.tools,
+              thinkingLevel: thinkingVal,
             });
 
             if (result.currentPath && result.currentPath !== defaultHomePath) {
               sessionStore.set(taskKey, result.currentPath);
-              console.log(`[Session Persisted] TaskKey ${taskKey} -> ${result.currentPath}`);
             }
 
             const payload: ChatCompletionResponse = {
@@ -228,12 +246,12 @@ export async function startServer(
                     content: result.cleanContent || null,
                     ...(result.toolCalls.length > 0
                       ? {
-                          tool_calls: result.toolCalls.map((tc) => ({
-                            id: tc.id,
-                            type: 'function' as const,
-                            function: { name: tc.name, arguments: tc.arguments },
-                          })),
-                        }
+                        tool_calls: result.toolCalls.map((tc) => ({
+                          id: tc.id,
+                          type: 'function' as const,
+                          function: { name: tc.name, arguments: tc.arguments },
+                        })),
+                      }
                       : {}),
                   },
                   finish_reason: result.toolCalls.length > 0 ? 'tool_calls' : 'stop',

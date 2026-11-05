@@ -32,7 +32,8 @@ export abstract class WebAiProvider {
   abstract sendPromptAndObserve(
     worker: PageWorker,
     prompt: string,
-    onRawChunk: (delta: string) => void
+    onRawChunk: (delta: string, isReasoning?: boolean) => void,
+    options?: { thinkingLevel?: string },
   ): Promise<{ rawText: string; currentPath: string }>;
 
   protected parseMcpTool(item: OpenAiTool): ParsedMcpMetadata {
@@ -68,7 +69,7 @@ export abstract class WebAiProvider {
       content += `## Universal Tool Calling Format (STRICT REQUIREMENT)\n`;
       content += `When you need to call any tool below, you MUST output a single JSON object prefixed with @use_mcp_tool directly in plain text.\n`;
       content += `CRITICAL: NEVER wrap @use_mcp_tool in markdown code blocks (\`\`\`json or \`\`\`).\n`;
-      content += `CRITICAL: If you need to invoke a tool, output @use_mcp_tool directly without intermediate thinking filler in the final text.\n\n`;
+      content += `CRITICAL: Output MUST start immediately with @use_mcp_tool followed by the JSON payload.\n\n`;
       content += `Format Structure:\n`;
       content += `@use_mcp_tool{"server_name":"EXACT_SERVER_NAME_FROM_DEFINITION","tool_name":"EXACT_TOOL_NAME_FROM_DEFINITION","arguments":{"param":"value"}}\n\n`;
       content += `=======================================================\n`;
@@ -260,9 +261,20 @@ export abstract class WebAiProvider {
     isNewConversation: boolean;
     targetPath?: string;
     tools?: OpenAiTool[];
+    thinkingLevel?: string;
     onTextDelta?: (delta: string) => void;
+    onReasoningDelta?: (delta: string) => void;
   }): Promise<ChatExecutionResult> {
-    const { worker, messages, isNewConversation, targetPath, tools, onTextDelta } = params;
+    const {
+      worker,
+      messages,
+      isNewConversation,
+      targetPath,
+      tools,
+      thinkingLevel,
+      onTextDelta,
+      onReasoningDelta,
+    } = params;
 
     await this.navigateConversation(worker.page, isNewConversation, targetPath);
 
@@ -295,21 +307,31 @@ export abstract class WebAiProvider {
         }): "${promptToSend.substring(0, 50).replace(/\n/g, ' ')}..."`
       );
 
-      let accumulatedRaw = '';
+      let accumulatedMainRaw = '';
       let streamedLength = 0;
       const PREFIX_TRIGGER = '@use_mcp';
       const PREFIX_LOWER = PREFIX_TRIGGER.toLowerCase();
 
-      const handleRawChunk = (delta: string) => {
-        accumulatedRaw += delta;
+      // 接收已分流的 Chunk
+      const handleRawChunk = (delta: string, isReasoning = false) => {
+        // 1. Thinking 串流：直接送往專屬思考通道，不計入正文字串
+        if (isReasoning) {
+          if (onReasoningDelta) {
+            onReasoningDelta(delta);
+          }
+          return;
+        }
+
+        // 2. 正式回答串流：經過 MCP 工具防護門禁檢查
+        accumulatedMainRaw += delta;
         if (!onTextDelta) return;
 
-        const lowerRaw = accumulatedRaw.toLowerCase();
+        const lowerRaw = accumulatedMainRaw.toLowerCase();
         const toolTagIdx = lowerRaw.indexOf(PREFIX_LOWER);
 
         if (toolTagIdx !== -1) {
           if (streamedLength < toolTagIdx) {
-            const chunkToSend = accumulatedRaw.slice(streamedLength, toolTagIdx);
+            const chunkToSend = accumulatedMainRaw.slice(streamedLength, toolTagIdx);
             streamedLength = toolTagIdx;
             if (chunkToSend) onTextDelta(chunkToSend);
           }
@@ -317,7 +339,7 @@ export abstract class WebAiProvider {
         }
 
         let matchPrefixLen = 0;
-        const maxCheck = Math.min(accumulatedRaw.length, PREFIX_TRIGGER.length - 1);
+        const maxCheck = Math.min(accumulatedMainRaw.length, PREFIX_TRIGGER.length - 1);
         for (let len = maxCheck; len >= 1; len--) {
           if (lowerRaw.endsWith(PREFIX_LOWER.slice(0, len))) {
             matchPrefixLen = len;
@@ -325,15 +347,15 @@ export abstract class WebAiProvider {
           }
         }
 
-        const safeEnd = accumulatedRaw.length - matchPrefixLen;
+        const safeEnd = accumulatedMainRaw.length - matchPrefixLen;
         if (safeEnd > streamedLength) {
-          const chunkToSend = accumulatedRaw.slice(streamedLength, safeEnd);
+          const chunkToSend = accumulatedMainRaw.slice(streamedLength, safeEnd);
           streamedLength = safeEnd;
           if (chunkToSend) onTextDelta(chunkToSend);
         }
       };
 
-      const { rawText, currentPath } = await this.sendPromptAndObserve(worker, promptToSend, handleRawChunk);
+      const { rawText, currentPath } = await this.sendPromptAndObserve(worker, promptToSend, handleRawChunk, { thinkingLevel });
       const { cleanContent, toolCalls } = this.extractToolCalls(rawText, tools);
 
       if (onTextDelta && toolCalls.length === 0 && streamedLength < cleanContent.length) {

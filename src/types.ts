@@ -53,6 +53,7 @@ export interface ChatCompletionRequestBody {
   stream?: boolean;
   conversation_id?: string;
   tools?: OpenAiTool[];
+  reasoning_effort: 'none' | 'low' | 'medium' | 'high' | 'xhigh';
 }
 
 export interface ToolCallDelta {

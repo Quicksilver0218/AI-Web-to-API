@@ -1,11 +1,14 @@
+import path from "path";
 import type { Page } from "playwright";
 
-export async function waitForVpnConnection(page: Page) {
+export const BROWSER_DATA_PATH = path.join(import.meta.dirname, 'browser_data');
+
+export async function waitForVpnConnection(page: Page, timeout = 60) {
   console.log('Checking VPN connection status...');
   let isVpnConnected = false;
   const ip = await fetch('https://api.ipify.org?format=json').then(res => res.json()).then(data => data.ip);
 
-  for (let i = 0; i < 30; i++) { // 最多等待 30 次（每次 2 秒，共 60 秒）
+  for (let i = 0; !timeout || i < timeout / 2; i++) {
     try {
       await page.goto('https://api.ipify.org?format=json', { timeout: 5000 });
       if ((await page.evaluate(() => JSON.parse(document.body.innerText))).ip !== ip) {
@@ -15,7 +18,7 @@ export async function waitForVpnConnection(page: Page) {
     } catch (e) {
       console.log('Retrying...');
     }
-    await new Promise(resolve => setTimeout(resolve, 2000)); // 等待 2 秒
+    await new Promise(resolve => setTimeout(resolve, 2000));
   }
 
   if (!isVpnConnected) {
