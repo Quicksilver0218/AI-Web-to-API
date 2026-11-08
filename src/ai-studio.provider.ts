@@ -666,7 +666,7 @@ export class AiStudioProvider extends WebAiProvider {
                   if (!running && turn) {
                     const errorMsg = getModelErrorText(turn);
                     if (errorMsg) {
-                      const isRetryable = /internal\s*error|permission\s*denied/i.test(errorMsg);
+                      const isRetryable = /internal\s*error/i.test(errorMsg);
                       if (isRetryable) {
                         void finish('retryable_error', errorMsg);
                       } else {
