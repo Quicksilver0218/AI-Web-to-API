@@ -41,8 +41,8 @@ async function dismissAiStudioDialogs(page: Page): Promise<void> {
   for (const selector of dialogSelectors) {
     try {
       const btn = page.locator(selector).first();
-      if (await btn.isVisible({ timeout: 400 }).catch(() => false)) {
-        await btn.click({ timeout: 1000 }).catch(() => { });
+      if (await btn.isVisible({ timeout: 80 }).catch(() => false)) {
+        await btn.click({ timeout: 1000 }).catch(() => {});
       }
     } catch {
       // 忽略單一彈窗檢查例外
@@ -315,6 +315,10 @@ export class AiStudioProvider extends WebAiProvider {
     const currentUrlObj = new URL(page.url());
     const currentPath = currentUrlObj.pathname;
 
+    // 持續監視對話框開關標記
+    let isWatchingDialogs = true;
+    let dialogWatcherPromise: Promise<void> | null = null;
+
     try {
       if (options?.abortSignal?.aborted) {
         this.dirtyPages.add(page);
@@ -328,6 +332,18 @@ export class AiStudioProvider extends WebAiProvider {
       console.log(`[AI Studio] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
 
       await this.submitPrompt(page, prompt);
+
+      // 發送後啟動背景非同步監視任務，持續清理可能阻擋回覆的彈窗
+      dialogWatcherPromise = (async () => {
+        while (isWatchingDialogs) {
+          try {
+            await dismissAiStudioDialogs(page);
+          } catch {
+            // 忽略輪詢異常
+          }
+          await page.waitForTimeout(300).catch(() => {});
+        }
+      })();
 
       await page
         .evaluate((scrollSelector: string) => {
@@ -347,6 +363,22 @@ export class AiStudioProvider extends WebAiProvider {
 
       await page.waitForFunction(
         ({ turnSelector, prevSnapshot }: WaitForTurnParams) => {
+          // 在瀏覽器端同步快速點擊彈窗按鈕
+          const dialogActionSelectors = [
+            '#g1-welcome-dialog button',
+            'ms-g1-welcome-dialog button',
+            'ms-auth-request-dialog button',
+            '#copyright-acknowledgement-dialog button',
+            'ms-copyright-acknowledgement-dialog button',
+            'ms-inline-preference-vote button[data-test-id="skip-button"]',
+            'button[aria-label="Skip preference vote"]',
+          ];
+          for (const sel of dialogActionSelectors) {
+            const el = document.querySelector(sel) as HTMLElement | null;
+            if (el && el.offsetParent !== null) {
+              el.click();
+            }
+          }
           return document.querySelectorAll(turnSelector).length > prevSnapshot;
         },
         {
@@ -408,6 +440,33 @@ export class AiStudioProvider extends WebAiProvider {
                     scriptContent
                 )();
                 const isModelRunning = (): boolean => fn(stopSelector);
+
+                function dismissDialogsInDom(): void {
+                  const inlineSelectors = [
+                    '#g1-welcome-dialog button[aria-label="Close dialog"]',
+                    'ms-g1-welcome-dialog button.ms-button-primary',
+                    'ms-auth-request-dialog button[aria-label="Cancel"]',
+                    '#copyright-acknowledgement-dialog button[aria-label="Agree to the copyright acknowledgement"]',
+                    'ms-copyright-acknowledgement-dialog button.ms-button-primary',
+                    'ms-inline-preference-vote button[data-test-id="skip-button"]',
+                    'button[aria-label="Skip preference vote"]',
+                  ];
+                  for (const sel of inlineSelectors) {
+                    const el = document.querySelector(sel) as HTMLElement | null;
+                    if (el && el.offsetParent !== null) {
+                      el.click();
+                    }
+                  }
+                  const textButtons = document.querySelectorAll(
+                    '#g1-welcome-dialog button, ms-auth-request-dialog button, #copyright-acknowledgement-dialog button'
+                  );
+                  for (const btn of Array.from(textButtons)) {
+                    const txt = (btn.textContent || '').trim().toLowerCase();
+                    if (txt.includes('continue') || txt.includes('cancel and use temporary chat') || txt.includes('acknowledge')) {
+                      (btn as HTMLElement).click();
+                    }
+                  }
+                }
 
                 function scrollToBottom(): void {
                   const scrollTarget = document.querySelector(
@@ -660,6 +719,9 @@ export class AiStudioProvider extends WebAiProvider {
                 const intervalTimer = window.setInterval(async () => {
                   if (isDone) return;
 
+                  // 每次檢查時在 DOM 端即時點擊清理對話框
+                  dismissDialogsInDom();
+
                   const turn = getLatestTurn();
                   const running = isModelRunning();
 
@@ -787,6 +849,12 @@ export class AiStudioProvider extends WebAiProvider {
         rawText: `[AI Studio Error]: ${errorMsg}`,
         currentPath,
       };
+    } finally {
+      // 確保退出時關閉背景監視任務
+      isWatchingDialogs = false;
+      if (dialogWatcherPromise) {
+        await dialogWatcherPromise.catch(() => {});
+      }
     }
   }
 }
