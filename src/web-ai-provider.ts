@@ -17,6 +17,12 @@ export interface ParsedMcpMetadata {
   params: string;
 }
 
+export interface ExtractToolCallsResult {
+  cleanContent: string;
+  toolCalls: ParsedToolCall[];
+  parseErrors: Array<{ rawJson: string; error: string }>;
+}
+
 export abstract class WebAiProvider {
   abstract readonly name: string;
   abstract readonly baseUrl: string;
@@ -52,8 +58,6 @@ export abstract class WebAiProvider {
       } else if (rawName.includes('__')) {
         const parts = rawName.split('__');
         serverName = parts[0];
-      } else {
-        serverName = 'File_System';
       }
     }
 
@@ -134,8 +138,9 @@ export abstract class WebAiProvider {
   public extractToolCalls(
     fullText: string,
     tools?: OpenAiTool[]
-  ): { cleanContent: string; toolCalls: ParsedToolCall[] } {
+  ): ExtractToolCallsResult {
     const toolCalls: ParsedToolCall[] = [];
+    const parseErrors: Array<{ rawJson: string; error: string }> = [];
     const marker = '@use_mcp_tool';
     let cleanContent = '';
     let cursor = 0;
@@ -165,6 +170,11 @@ export abstract class WebAiProvider {
       }
 
       if (braceStart >= fullText.length || fullText[braceStart] !== '{') {
+        const snippet = fullText.slice(markerIdx, Math.min(fullText.length, markerIdx + 100));
+        parseErrors.push({
+          rawJson: snippet,
+          error: 'Missing opening brace "{" immediately following @use_mcp_tool',
+        });
         cursor = markerIdx + marker.length;
         continue;
       }
@@ -206,6 +216,11 @@ export abstract class WebAiProvider {
       }
 
       if (braceEnd === -1) {
+        const brokenJson = fullText.slice(braceStart);
+        parseErrors.push({
+          rawJson: brokenJson,
+          error: 'Unclosed JSON object (missing matching closing "}")',
+        });
         cursor = braceStart + 1;
         continue;
       }
@@ -232,6 +247,10 @@ export abstract class WebAiProvider {
             : ''
         ).trim();
 
+        if (!toolNameRaw) {
+          throw new Error('Missing "tool_name" or "name" in payload object');
+        }
+
         const resolvedName = this.resolveExactToolName(toolNameRaw, tools);
 
         let argsPayload = '{}';
@@ -248,11 +267,13 @@ export abstract class WebAiProvider {
           arguments: argsPayload,
         });
       } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
         console.error('[WebAiProvider] Failed to parse @use_mcp_tool JSON payload:', jsonStr, err);
+        parseErrors.push({ rawJson: jsonStr, error: errorMsg });
       }
     }
 
-    return { cleanContent: cleanContent.trim(), toolCalls };
+    return { cleanContent: cleanContent.trim(), toolCalls, parseErrors };
   }
 
   public async executeChat(params: {
@@ -301,77 +322,100 @@ export abstract class WebAiProvider {
         promptToSend = this.formatContinuationPrompt(messages);
       }
 
-      console.log(
-        `[${this.name}] Worker #${worker.id} sending message (${
-          isNewConversation ? 'new session' : 'continuation'
-        }): "${promptToSend.substring(0, 50).replace(/\n/g, ' ')}..."`
-      );
+      const maxParseRetries = 2;
+      let retryCount = 0;
 
-      let accumulatedMainRaw = '';
-      let streamedLength = 0;
-      const PREFIX_TRIGGER = '@use_mcp';
-      const PREFIX_LOWER = PREFIX_TRIGGER.toLowerCase();
+      while (true) {
+        console.log(
+          `[${this.name}] Worker #${worker.id} sending message (${
+            isNewConversation && retryCount === 0 ? 'new session' : 'continuation'
+          }): "${promptToSend.substring(0, 50).replace(/\n/g, ' ')}..."`
+        );
 
-      // 接收已分流的 Chunk
-      const handleRawChunk = (delta: string, isReasoning = false) => {
-        // 1. Thinking 串流：直接送往專屬思考通道，不計入正文字串
-        if (isReasoning) {
-          if (onReasoningDelta) {
-            onReasoningDelta(delta);
+        let accumulatedMainRaw = '';
+        let streamedLength = 0;
+        const PREFIX_TRIGGER = '@use_mcp';
+        const PREFIX_LOWER = PREFIX_TRIGGER.toLowerCase();
+
+        const handleRawChunk = (delta: string, isReasoning = false) => {
+          if (isReasoning) {
+            if (onReasoningDelta) {
+              onReasoningDelta(delta);
+            }
+            return;
           }
-          return;
-        }
 
-        // 2. 正式回答串流：經過 MCP 工具防護門禁檢查
-        accumulatedMainRaw += delta;
-        if (!onTextDelta) return;
+          accumulatedMainRaw += delta;
+          if (!onTextDelta) return;
 
-        const lowerRaw = accumulatedMainRaw.toLowerCase();
-        const toolTagIdx = lowerRaw.indexOf(PREFIX_LOWER);
+          const lowerRaw = accumulatedMainRaw.toLowerCase();
+          const toolTagIdx = lowerRaw.indexOf(PREFIX_LOWER);
 
-        if (toolTagIdx !== -1) {
-          if (streamedLength < toolTagIdx) {
-            const chunkToSend = accumulatedMainRaw.slice(streamedLength, toolTagIdx);
-            streamedLength = toolTagIdx;
+          if (toolTagIdx !== -1) {
+            if (streamedLength < toolTagIdx) {
+              const chunkToSend = accumulatedMainRaw.slice(streamedLength, toolTagIdx);
+              streamedLength = toolTagIdx;
+              if (chunkToSend) onTextDelta(chunkToSend);
+            }
+            return;
+          }
+
+          let matchPrefixLen = 0;
+          const maxCheck = Math.min(accumulatedMainRaw.length, PREFIX_TRIGGER.length - 1);
+          for (let len = maxCheck; len >= 1; len--) {
+            if (lowerRaw.endsWith(PREFIX_LOWER.slice(0, len))) {
+              matchPrefixLen = len;
+              break;
+            }
+          }
+
+          const safeEnd = accumulatedMainRaw.length - matchPrefixLen;
+          if (safeEnd > streamedLength) {
+            const chunkToSend = accumulatedMainRaw.slice(streamedLength, safeEnd);
+            streamedLength = safeEnd;
             if (chunkToSend) onTextDelta(chunkToSend);
           }
-          return;
+        };
+
+        const { rawText, currentPath } = await this.sendPromptAndObserve(
+          worker,
+          promptToSend,
+          handleRawChunk,
+          { thinkingLevel }
+        );
+
+        const { cleanContent, toolCalls, parseErrors } = this.extractToolCalls(rawText, tools);
+
+        // 當工具調用 JSON 解析失敗且未取得任何合法 tool call 時，發送提示要求模型修正重發
+        if (parseErrors.length > 0 && toolCalls.length === 0 && retryCount < maxParseRetries) {
+          retryCount++;
+          const errorDetails = parseErrors
+            .map((e, idx) => `[Error ${idx + 1}]: ${e.error}\nInvalid JSON payload: ${e.rawJson}`)
+            .join('\n\n');
+
+          console.warn(
+            `[${this.name}] Worker #${worker.id} detected malformed @use_mcp_tool JSON (${retryCount}/${maxParseRetries}). Sending corrective prompt...`
+          );
+
+          promptToSend = `[System Notice: Tool Call Format Error]\nFailed to parse your @use_mcp_tool JSON payload:\n${errorDetails}\n\nPlease correct the syntax and invoke the tool again immediately.\nCRITICAL RULES:\n1. Strictly output in plain text: @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}}\n2. Must be strictly valid JSON: all property names and string values MUST use double quotes ("..."), and do NOT include trailing commas.\n3. All file paths MUST use forward slashes (/) instead of single backslashes (\\).\n4. Do NOT wrap in markdown code blocks (\`\`\`json or \`\`\`). Output plain text only.`;
+          continue;
         }
 
-        let matchPrefixLen = 0;
-        const maxCheck = Math.min(accumulatedMainRaw.length, PREFIX_TRIGGER.length - 1);
-        for (let len = maxCheck; len >= 1; len--) {
-          if (lowerRaw.endsWith(PREFIX_LOWER.slice(0, len))) {
-            matchPrefixLen = len;
-            break;
+        if (onTextDelta && toolCalls.length === 0 && streamedLength < cleanContent.length) {
+          const remainingChunk = cleanContent.slice(streamedLength);
+          if (remainingChunk && !/@use_mcp/i.test(remainingChunk)) {
+            onTextDelta(remainingChunk);
+            streamedLength = cleanContent.length;
           }
         }
 
-        const safeEnd = accumulatedMainRaw.length - matchPrefixLen;
-        if (safeEnd > streamedLength) {
-          const chunkToSend = accumulatedMainRaw.slice(streamedLength, safeEnd);
-          streamedLength = safeEnd;
-          if (chunkToSend) onTextDelta(chunkToSend);
-        }
-      };
-
-      const { rawText, currentPath } = await this.sendPromptAndObserve(worker, promptToSend, handleRawChunk, { thinkingLevel });
-      const { cleanContent, toolCalls } = this.extractToolCalls(rawText, tools);
-
-      if (onTextDelta && toolCalls.length === 0 && streamedLength < cleanContent.length) {
-        const remainingChunk = cleanContent.slice(streamedLength);
-        if (remainingChunk && !/@use_mcp/i.test(remainingChunk)) {
-          onTextDelta(remainingChunk);
-          streamedLength = cleanContent.length;
-        }
+        return {
+          rawText,
+          currentPath,
+          cleanContent,
+          toolCalls,
+        };
       }
-
-      return {
-        rawText,
-        currentPath,
-        cleanContent,
-        toolCalls,
-      };
     } finally {
       if (tempFilePath) {
         await fs.unlink(tempFilePath).catch(() => {});

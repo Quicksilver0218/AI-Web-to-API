@@ -9,6 +9,8 @@ interface WaitForTurnParams {
 
 interface ObserveAiStudioParams {
   turnSelector: string;
+  scrollSelector: string;
+  prevCount: number;
 }
 
 export class AiStudioProvider extends WebAiProvider {
@@ -47,10 +49,10 @@ export class AiStudioProvider extends WebAiProvider {
     CHAT_TURN: 'ms-chat-turn',
     MODEL_TURN: 'ms-chat-turn .chat-turn-container.model, ms-chat-turn[data-turn-role="Model"]',
     MODEL_ERROR: '.model-error, [class*="model-error"]',
-    RERUN_BUTTON: 'button.rerun-button, button[name="rerun-button"], button[aria-label*="Rerun" i]',
     THINKING_SELECT: 'mat-select[aria-label="Thinking Level"]',
     THINKING_SELECT_VALUE: '.mat-mdc-select-min-line, .mat-mdc-select-value-text',
     THINKING_PANEL: '.mat-mdc-select-panel[aria-label="Thinking Level"], .mat-mdc-select-panel',
+    SCROLL_CONTAINER: 'ms-autoscroll-container',
   } as const;
 
   /**
@@ -73,8 +75,7 @@ export class AiStudioProvider extends WebAiProvider {
   public async setThinkingLevel(page: Page, targetLevel: 'Low' | 'Medium' | 'High'): Promise<void> {
     try {
       const selectLocator = page.locator(this.selectors.THINKING_SELECT).first();
-      if (!(await selectLocator.isVisible({ timeout: 2500 }).catch(() => false))) {
-        console.log('[AI Studio] Thinking Level selector not found on page, skipping.');
+      if (!(await selectLocator.isVisible({ timeout: 2000 }).catch(() => false))) {
         return;
       }
 
@@ -83,7 +84,6 @@ export class AiStudioProvider extends WebAiProvider {
       ).trim();
 
       if (currentVal.toLowerCase() === targetLevel.toLowerCase()) {
-        console.log(`[AI Studio] Thinking Level already set to "${currentVal}".`);
         return;
       }
 
@@ -96,13 +96,16 @@ export class AiStudioProvider extends WebAiProvider {
         .filter({ hasText: new RegExp(`^\\s*${targetLevel}\\s*$`, 'i') })
         .first();
 
-      if (await optionLocator.isVisible({ timeout: 3000 }).catch(() => false)) {
+      if (await optionLocator.isVisible({ timeout: 2500 }).catch(() => false)) {
         await optionLocator.click({ timeout: 2000 });
         console.log(`[AI Studio] Successfully applied Thinking Level: "${targetLevel}"`);
       } else {
-        console.warn(`[AI Studio] Option "${targetLevel}" not visible in dropdown panel.`);
         await page.keyboard.press('Escape').catch(() => {});
       }
+
+      await page.waitForSelector('.cdk-overlay-pane:has(mat-option)', { state: 'detached', timeout: 1500 }).catch(async () => {
+        await page.keyboard.press('Escape').catch(() => {});
+      });
     } catch (err) {
       console.warn('[AI Studio] setThinkingLevel error:', err);
       await page.keyboard.press('Escape').catch(() => {});
@@ -112,10 +115,9 @@ export class AiStudioProvider extends WebAiProvider {
   public async dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
     const welcomeBtn = page.locator(this.selectors.WELCOME_DIALOG_BUTTON).first();
     try {
-      if (await welcomeBtn.isVisible({ timeout: 1500 })) {
-        console.log('[AI Studio] Detected welcome dialog, clicking "Continue"...');
+      if (await welcomeBtn.isVisible({ timeout: 1000 })) {
         await welcomeBtn.click();
-        await welcomeBtn.waitFor({ state: 'hidden', timeout: 4000 }).catch(() => {});
+        await welcomeBtn.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
       }
     } catch {
       // Ignore
@@ -125,10 +127,9 @@ export class AiStudioProvider extends WebAiProvider {
   public async dismissTemporaryChatDialogIfPresent(page: Page): Promise<void> {
     const tempChatBtn = page.locator(this.selectors.TEMPORARY_CHAT_BUTTON).first();
     try {
-      if (await tempChatBtn.isVisible({ timeout: 1500 })) {
-        console.log('[AI Studio] Detected Google Drive dialog, clicking "Cancel and use Temporary chat"...');
+      if (await tempChatBtn.isVisible({ timeout: 1000 })) {
         await tempChatBtn.click();
-        await tempChatBtn.waitFor({ state: 'hidden', timeout: 4000 }).catch(() => {});
+        await tempChatBtn.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
       }
     } catch {
       // Ignore
@@ -138,10 +139,9 @@ export class AiStudioProvider extends WebAiProvider {
   public async dismissCopyrightDialogIfPresent(page: Page): Promise<void> {
     const ackBtn = page.locator(this.selectors.COPYRIGHT_ACK_BUTTON).first();
     try {
-      if (await ackBtn.isVisible({ timeout: 1500 })) {
-        console.log('[AI Studio] Detected copyright dialog, clicking "Acknowledge"...');
+      if (await ackBtn.isVisible({ timeout: 1000 })) {
         await ackBtn.click();
-        await ackBtn.waitFor({ state: 'hidden', timeout: 4000 }).catch(() => {});
+        await ackBtn.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
       }
     } catch {
       // Ignore
@@ -151,10 +151,9 @@ export class AiStudioProvider extends WebAiProvider {
   public async dismissPreferenceVoteIfPresent(page: Page): Promise<void> {
     const skipBtn = page.locator(this.selectors.PREFERENCE_SKIP_BUTTON).first();
     try {
-      if (await skipBtn.isVisible({ timeout: 1500 })) {
-        console.log('[AI Studio] Detected preference vote dialog, clicking "Skip"...');
+      if (await skipBtn.isVisible({ timeout: 1000 })) {
         await skipBtn.click();
-        await skipBtn.waitFor({ state: 'hidden', timeout: 4000 }).catch(() => {});
+        await skipBtn.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
       }
     } catch {
       // Ignore
@@ -171,20 +170,17 @@ export class AiStudioProvider extends WebAiProvider {
   public async ensureRawModeEnabled(page: Page): Promise<void> {
     try {
       const moreActionsLocator = page.locator(this.selectors.VIEW_MORE_ACTIONS_BUTTON);
-      const count = await moreActionsLocator.count();
-      if (count === 0) {
-        console.log('[AI Studio] "View more actions" button not found.');
+      if ((await moreActionsLocator.count()) === 0) {
         return;
       }
 
       const moreActionsBtn = moreActionsLocator.last();
-      await moreActionsBtn.waitFor({ state: 'visible', timeout: 3000 });
+      await moreActionsBtn.waitFor({ state: 'visible', timeout: 2000 });
       await moreActionsBtn.scrollIntoViewIfNeeded().catch(() => {});
       await moreActionsBtn.click({ timeout: 2000 });
-      console.log('[AI Studio] Opened "View more actions" menu to check Raw Mode status...');
 
       const rawModeBtn = page.locator(this.selectors.RAW_MODE_BUTTON).first();
-      await rawModeBtn.waitFor({ state: 'visible', timeout: 3000 });
+      await rawModeBtn.waitFor({ state: 'visible', timeout: 2500 });
 
       const checkmarkInBtn = rawModeBtn.locator(this.selectors.RAW_MODE_CHECKMARK);
       const globalCheckmark = page.locator(this.selectors.RAW_MODE_CHECKMARK);
@@ -194,11 +190,9 @@ export class AiStudioProvider extends WebAiProvider {
         (await globalCheckmark.count()) > 0;
 
       if (!hasCheckmark) {
-        console.log('[AI Studio] Checkmark [data-test-raw-mode-checkmark] not found. Clicking to enable Raw Mode...');
+        console.log('[AI Studio] Checkmark not found. Enabling Raw Mode...');
         await rawModeBtn.click({ timeout: 2000 });
-        console.log('[AI Studio] Raw Mode enabled.');
       } else {
-        console.log('[AI Studio] Checkmark [data-test-raw-mode-checkmark] detected. Raw Mode already enabled.');
         await page.keyboard.press('Escape').catch(() => {});
       }
     } catch (err) {
@@ -247,16 +241,15 @@ export class AiStudioProvider extends WebAiProvider {
       const existingTurns = await page.locator(this.selectors.CHAT_TURN).count().catch(() => 0);
 
       if (hasChattedInSession || existingTurns > 0) {
-        console.log(`[AI Studio] Prior conversation detected (turns: ${existingTurns}, sessionActive: ${hasChattedInSession}). Resetting page for new session...`);
+        console.log(`[AI Studio] Resetting page for new session...`);
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
         this.hasChattedPages.delete(page);
-      } else {
-        console.log('[AI Studio] Page is clean and unprompted. Skipping initial page reload.');
       }
+      await this.dismissAllDialogs(page);
+      await this.ensureRawModeEnabled(page);
+    } else {
+      await this.dismissAllDialogs(page);
     }
-
-    await this.dismissAllDialogs(page);
-    await this.ensureRawModeEnabled(page);
   }
 
   async sendPromptAndObserve(
@@ -268,56 +261,74 @@ export class AiStudioProvider extends WebAiProvider {
     const { page, emitter, id } = worker;
 
     await this.dismissAllDialogs(page);
-    await this.ensureRawModeEnabled(page);
 
-    // 套用 thinking header 對應之 Thinking Level
     const targetLevel = this.mapThinkingLevel(options?.thinkingLevel);
     if (targetLevel) {
-      console.log(`[AI Studio] Worker #${id} applying Thinking Level: ${targetLevel} (from: "${options?.thinkingLevel}")`);
       await this.setThinkingLevel(page, targetLevel);
     }
 
     const input = page.locator(this.selectors.PROMPT_INPUT).first();
     await input.waitFor({ state: 'visible', timeout: 20000 });
 
-    const modelTurns = page.locator(this.selectors.MODEL_TURN);
-    const prevCount = await modelTurns.count();
-    console.log(`[AI Studio] Worker #${id} model turn count before prompt: ${prevCount}`);
+    const submitPrompt = async () => {
+      await input.click();
+      await input.fill('');
+      await input.fill(prompt);
+      await input.dispatchEvent('input');
+      await input.dispatchEvent('change');
 
-    await input.click();
-    await input.fill(prompt);
-    await input.dispatchEvent('input');
-    await input.dispatchEvent('change');
+      await this.dismissAllDialogs(page);
 
-    await this.dismissAllDialogs(page);
+      const runBtn = page.locator(this.selectors.RUN_BUTTON).first();
+      let submitted = false;
 
-    const runBtn = page.locator(this.selectors.RUN_BUTTON).first();
-    let submitted = false;
-
-    try {
-      if (await runBtn.isVisible({ timeout: 2000 })) {
-        await runBtn.click({ timeout: 2000 });
-        submitted = true;
+      try {
+        if (await runBtn.isVisible({ timeout: 2000 })) {
+          await runBtn.click({ timeout: 2000 });
+          submitted = true;
+        }
+      } catch {
+        // Fallback
       }
-    } catch {
-      // Fallback
-    }
 
-    if (!submitted) {
-      await input.focus();
-      await page.keyboard.press('Enter');
-    }
+      if (!submitted) {
+        await input.focus();
+        await page.keyboard.press('Enter');
+      }
 
-    this.hasChattedPages.add(page);
+      this.hasChattedPages.add(page);
 
-    await page.waitForTimeout(600);
-    const remainingVal = await input.inputValue().catch(() => '');
-    if (remainingVal.trim().length > 0) {
-      console.log(`[AI Studio] Worker #${id} prompt remaining, executing forced submit...`);
-      await input.focus();
-      await page.keyboard.press('Enter');
-      await runBtn.click({ force: true, timeout: 2000 }).catch(() => {});
-    }
+      await page.waitForTimeout(600);
+      const remainingVal = await input.inputValue().catch(() => '');
+      if (remainingVal.trim().length > 0) {
+        console.log(`[AI Studio] Worker #${id} prompt remaining, executing forced submit...`);
+        await runBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+        await input.focus();
+        await page.keyboard.press('Enter');
+      }
+    };
+
+    let currentTurnCount = await page.locator(this.selectors.MODEL_TURN).count();
+    console.log(`[AI Studio] Worker #${id} model turn count before prompt: ${currentTurnCount}`);
+
+    await submitPrompt();
+
+    // 發送後立即執行一次置底雙軌捲動
+    await page
+      .evaluate((scrollSelector: string) => {
+        const scrollTarget = document.querySelector(
+          'ms-thought-chunk:last-of-type, .thought-container:last-of-type, mat-expansion-panel:last-of-type, ms-chat-turn:last-of-type'
+        );
+        if (scrollTarget) {
+          scrollTarget.scrollIntoView({ block: 'end', behavior: 'auto' });
+        }
+
+        const scroller = document.querySelector(scrollSelector);
+        if (scroller && scroller.scrollHeight > scroller.clientHeight) {
+          scroller.scrollTop = scroller.scrollHeight;
+        }
+      }, this.selectors.SCROLL_CONTAINER)
+      .catch(() => {});
 
     await page.waitForFunction(
       ({ turnSelector, prevCount }: WaitForTurnParams) => {
@@ -326,8 +337,9 @@ export class AiStudioProvider extends WebAiProvider {
       },
       {
         turnSelector: this.selectors.MODEL_TURN,
-        prevCount,
-      }
+        prevCount: currentTurnCount,
+      },
+      { timeout: 30000 }
     );
 
     console.log(`[AI Studio] Worker #${id} new model turn detected.`);
@@ -361,17 +373,46 @@ export class AiStudioProvider extends WebAiProvider {
     let errorAttempt = 0;
 
     try {
-      // 具備錯誤偵測與自動點擊 Rerun 重試的觀察循環
       while (errorAttempt <= maxModelErrorRetries) {
         finalMainText = await page.evaluate(
-          ({ turnSelector }: ObserveAiStudioParams) => {
+          ({ turnSelector, scrollSelector, prevCount }: ObserveAiStudioParams) => {
             return new Promise<string>((resolve) => {
               const customWindow = window as unknown as WindowWithCustomEvents;
 
+              // 雙軌滾動：原生 scrollIntoView 沿祖先鏈置底 + 滾動容器設置 scrollTop
+              function scrollToBottom(): void {
+                const scrollTarget = document.querySelector(
+                  'ms-thought-chunk:last-of-type, .thought-container:last-of-type, mat-expansion-panel:last-of-type, ms-chat-turn:last-of-type .turn-content, ms-chat-turn:last-of-type, .chat-turn-container.model:last-of-type'
+                );
+
+                if (scrollTarget) {
+                  scrollTarget.scrollIntoView({ block: 'end', behavior: 'auto' });
+                }
+
+                const scroller = document.querySelector(scrollSelector);
+                if (scroller && scroller.scrollHeight > scroller.clientHeight) {
+                  scroller.scrollTop = scroller.scrollHeight;
+                }
+
+                if (
+                  document.scrollingElement &&
+                  document.scrollingElement.scrollHeight > document.scrollingElement.clientHeight
+                ) {
+                  document.scrollingElement.scrollTop = document.scrollingElement.scrollHeight;
+                }
+              }
+
+              scrollToBottom();
+              const scrollInterval = window.setInterval(scrollToBottom, 2000);
+
+              function getModelTurns(): HTMLElement[] {
+                return Array.from(document.querySelectorAll(turnSelector)) as HTMLElement[];
+              }
+
               function getLatestTurn(): HTMLElement | null {
-                const turns = document.querySelectorAll(turnSelector);
+                const turns = getModelTurns();
                 if (turns.length === 0) return null;
-                return turns[turns.length - 1] as HTMLElement;
+                return turns[turns.length - 1];
               }
 
               function isAiStudioRunning(): boolean {
@@ -437,55 +478,84 @@ export class AiStudioProvider extends WebAiProvider {
                 return false;
               }
 
-              function getThoughtText(turnRoot: HTMLElement | null): string {
+              // 提取 .model-error 純文字
+              function getModelErrorText(turnRoot: HTMLElement | null): string {
                 if (!turnRoot) return '';
-                const thoughtChunks = turnRoot.querySelectorAll(
-                  'ms-thought-chunk, ms-thought-panel, ms-thought, .thought-container, .thought-chunk'
-                );
-
-                if (thoughtChunks.length > 0) {
-                  const parts: string[] = [];
-                  thoughtChunks.forEach((chunk) => {
-                    const clone = chunk.cloneNode(true) as HTMLElement;
-                    clone.querySelectorAll('mat-expansion-panel-header, button, mat-icon, .actions, .turn-footer').forEach((el) => el.remove());
-                    clone.querySelectorAll('h1, h2, h3, h4, p, span, div').forEach((el) => {
-                      const t = el.textContent?.trim();
-                      if (t === 'Thinking' || t === 'Thought' || t === 'Thoughts') el.remove();
-                    });
-                    const txt = (clone.innerText || clone.textContent || '').trim();
-                    if (txt) parts.push(txt);
-                  });
-                  return parts.join('\n\n').trim();
-                }
-
-                const panels = turnRoot.querySelectorAll('mat-expansion-panel');
-                const parts: string[] = [];
-                panels.forEach((panel) => {
-                  const header = panel.querySelector('mat-expansion-panel-header');
-                  if (header && /thought|thinking/i.test(header.textContent || '')) {
-                    const clone = panel.cloneNode(true) as HTMLElement;
-                    clone.querySelector('mat-expansion-panel-header')?.remove();
-                    const txt = (clone.innerText || clone.textContent || '').trim();
-                    if (txt) parts.push(txt);
-                  }
-                });
-                return parts.join('\n\n').trim();
+                const errorEl = turnRoot.querySelector('.model-error, [class*="model-error"]');
+                if (!errorEl) return '';
+                const clone = errorEl.cloneNode(true) as HTMLElement;
+                clone.querySelectorAll('.material-symbols-outlined, mat-icon, button').forEach((el) => el.remove());
+                return (clone.innerText || clone.textContent || '').trim();
               }
 
-              function getMainText(turnRoot: HTMLElement | null): string {
-                if (!turnRoot) return '';
+              // 提取思考文字：支援當前回合或前一回合獨立的 Thinking Turn
+              function getThoughtText(): string {
+                const turns = getModelTurns();
+                if (turns.length === 0) return '';
 
-                const textNode = turnRoot.querySelector('ms-prompt-chunk.text-chunk, ms-text-chunk, ms-prompt-chunk:not(:has(ms-thought-chunk)):not(ms-thought-chunk)');
-                
-                let targetElement: HTMLElement | null = textNode as HTMLElement | null;
-                
-                if (!targetElement) {
-                  const isThinkingOnly = turnRoot.querySelector('ms-thought-chunk, .thought-container') !== null;
-                  if (isThinkingOnly) return '';
-                  targetElement = turnRoot;
+                const candidateTurns: HTMLElement[] = [];
+                for (let i = Math.max(0, prevCount); i < turns.length; i++) {
+                  candidateTurns.push(turns[i]);
+                }
+                if (candidateTurns.length === 0) {
+                  candidateTurns.push(turns[turns.length - 1]);
                 }
 
-                const clone = targetElement.cloneNode(true) as HTMLElement;
+                for (let i = candidateTurns.length - 1; i >= 0; i--) {
+                  const tRoot = candidateTurns[i];
+                  const thoughtChunks = tRoot.querySelectorAll(
+                    'ms-thought-chunk, ms-thought-panel, ms-thought, .thought-container, .thought-chunk'
+                  );
+
+                  if (thoughtChunks.length > 0) {
+                    const parts: string[] = [];
+                    thoughtChunks.forEach((chunk) => {
+                      const clone = chunk.cloneNode(true) as HTMLElement;
+                      clone
+                        .querySelectorAll('mat-expansion-panel-header, button, mat-icon, .actions, .turn-footer')
+                        .forEach((el) => el.remove());
+                      clone.querySelectorAll('h1, h2, h3, h4, p, span, div').forEach((el) => {
+                        const t = el.textContent?.trim();
+                        if (t === 'Thinking' || t === 'Thought' || t === 'Thoughts') el.remove();
+                      });
+                      const txt = (clone.innerText || clone.textContent || '').trim();
+                      if (txt) parts.push(txt);
+                    });
+                    if (parts.length > 0) return parts.join('\n\n').trim();
+                  }
+
+                  const panels = tRoot.querySelectorAll('mat-expansion-panel');
+                  const parts: string[] = [];
+                  panels.forEach((panel) => {
+                    const header = panel.querySelector('mat-expansion-panel-header');
+                    if (header && /thought|thinking/i.test(header.textContent || '')) {
+                      const clone = panel.cloneNode(true) as HTMLElement;
+                      clone.querySelector('mat-expansion-panel-header')?.remove();
+                      const txt = (clone.innerText || clone.textContent || '').trim();
+                      if (txt) parts.push(txt);
+                    }
+                  });
+                  if (parts.length > 0) return parts.join('\n\n').trim();
+                }
+
+                return '';
+              }
+
+              // 提取主回答文字：始終由最新回合提取，並徹底隔離思考標籤
+              function getMainText(): string {
+                const turns = getModelTurns();
+                if (turns.length === 0) return '';
+                const turnRoot = turns[turns.length - 1];
+
+                const turnContent = turnRoot.querySelector('.turn-content') || turnRoot;
+
+                const hasOnlyThinking =
+                  turnRoot.querySelector('ms-thought-chunk, .thought-container') !== null &&
+                  turnRoot.querySelector('.very-large-text-container, ms-text-chunk, ms-prompt-chunk.text-chunk, pre, textarea') === null;
+
+                if (hasOnlyThinking) return '';
+
+                const clone = turnContent.cloneNode(true) as HTMLElement;
 
                 clone
                   .querySelectorAll(
@@ -511,7 +581,7 @@ export class AiStudioProvider extends WebAiProvider {
                   }
                 }
 
-                const thought = getThoughtText(turnRoot);
+                const thought = getThoughtText();
                 if (thought && text.startsWith(thought)) {
                   text = text.slice(thought.length).trimStart();
                 }
@@ -526,10 +596,8 @@ export class AiStudioProvider extends WebAiProvider {
 
               function emitDelta(): void {
                 if (isDone) return;
-                const turn = getLatestTurn();
-                if (!turn) return;
 
-                const currentThought = getThoughtText(turn);
+                const currentThought = getThoughtText();
                 if (currentThought.length > lastThoughtLen) {
                   const thoughtDelta = currentThought.slice(lastThoughtLen);
                   lastThoughtLen = currentThought.length;
@@ -539,7 +607,7 @@ export class AiStudioProvider extends WebAiProvider {
                   );
                 }
 
-                const currentMain = getMainText(turn);
+                const currentMain = getMainText();
                 if (currentMain.length > lastMainLen) {
                   const mainDelta = currentMain.slice(lastMainLen);
                   lastMainLen = currentMain.length;
@@ -553,8 +621,8 @@ export class AiStudioProvider extends WebAiProvider {
               function finishWithError(): void {
                 if (isDone) return;
                 isDone = true;
-                observer.disconnect();
                 clearInterval(intervalTimer);
+                clearInterval(scrollInterval);
                 resolve('__AISTUDIO_MODEL_ERROR__');
               }
 
@@ -562,11 +630,10 @@ export class AiStudioProvider extends WebAiProvider {
                 if (isDone) return;
                 isDone = true;
 
-                observer.disconnect();
                 clearInterval(intervalTimer);
+                clearInterval(scrollInterval);
 
-                const turn = getLatestTurn();
-                const finalThought = getThoughtText(turn);
+                const finalThought = getThoughtText();
                 if (finalThought.length > lastThoughtLen) {
                   const thoughtDelta = finalThought.slice(lastThoughtLen);
                   lastThoughtLen = finalThought.length;
@@ -575,7 +642,7 @@ export class AiStudioProvider extends WebAiProvider {
                   );
                 }
 
-                const finalMain = getMainText(turn);
+                const finalMain = getMainText();
                 if (finalMain.length > lastMainLen) {
                   const mainDelta = finalMain.slice(lastMainLen);
                   lastMainLen = finalMain.length;
@@ -588,7 +655,9 @@ export class AiStudioProvider extends WebAiProvider {
                 resolve(finalMain);
               }
 
-              const observer = new MutationObserver(() => {
+              const intervalTimer = window.setInterval(async () => {
+                if (isDone) return;
+
                 const skipBtn = document.querySelector(
                   'ms-inline-preference-vote button[data-test-id="skip-button"], button[aria-label="Skip preference vote"]'
                 ) as HTMLElement | null;
@@ -596,65 +665,71 @@ export class AiStudioProvider extends WebAiProvider {
                   skipBtn.click();
                 }
 
-                // 遇到 Permission denied 等 .model-error 時立即中斷轉由上層重試
                 const turn = getLatestTurn();
-                if (turn && turn.querySelector('.model-error') && !isAiStudioRunning()) {
-                  finishWithError();
-                  return;
-                }
-
-                emitDelta();
-              });
-
-              observer.observe(document.body, {
-                childList: true,
-                subtree: true,
-                characterData: true,
-              });
-
-              const intervalTimer = window.setInterval(() => {
-                if (isDone) return;
-                emitDelta();
-
-                const turn = getLatestTurn();
-                const currentMain = turn ? getMainText(turn) : '';
                 const running = isAiStudioRunning();
 
-                // 輪詢檢測 .model-error
-                if (!running && turn && turn.querySelector('.model-error')) {
-                  finishWithError();
-                  return;
+                // 錯誤檢查：預設作為回應返回，只有 internal error 和 Permission denied 才重試
+                if (!running && turn) {
+                  const errorMsg = getModelErrorText(turn);
+                  if (errorMsg) {
+                    const isRetryableError = /internal\s*error|permission\s*denied/i.test(errorMsg);
+
+                    if (isRetryableError) {
+                      finishWithError();
+                      return;
+                    }
+
+                    // 預設行為：將錯誤文字作為正式回應返回給呼叫端
+                    isDone = true;
+                    clearInterval(intervalTimer);
+                    clearInterval(scrollInterval);
+                    await customWindow.__pushChunk(
+                      JSON.stringify({ type: 'content', delta: errorMsg })
+                    );
+                    await customWindow.__pushDone();
+                    resolve(errorMsg);
+                    return;
+                  }
                 }
 
-                if (!running && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
+                emitDelta();
+
+                const currentMain = getMainText();
+
+                // 情況 1：已輸出完整 MCP 工具調用
+                if (currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
+                  if (!running || Date.now() - lastChangeTime > 1200) {
+                    void finish();
+                    return;
+                  }
+                }
+
+                // 情況 2：模型停止運行，且已產出實質正文（絕不在 lastMainLen === 0 的思考階段早退）
+                if (!running && lastMainLen > 0 && Date.now() - lastChangeTime > 1500) {
                   void finish();
                   return;
                 }
 
-                const vote = document.querySelector('ms-inline-preference-vote .inline-preference-options');
-                if (vote) {
+                // 情況 3：正文產出中的正常停頓防護
+                if (lastMainLen > 0 && Date.now() - lastChangeTime > 15000) {
                   void finish();
                   return;
                 }
 
-                const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
-
-                if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1200) {
+                // 情況 4：兜底超時（45 秒無任何輸出）
+                if (Date.now() - lastChangeTime > 45000) {
                   void finish();
                   return;
                 }
-
-                if (hasGeneratedAny && Date.now() - lastChangeTime > 12000) {
-                  void finish();
-                  return;
-                }
-              }, 250);
+              }, 150);
 
               emitDelta();
             });
           },
           {
             turnSelector: this.selectors.MODEL_TURN,
+            scrollSelector: this.selectors.SCROLL_CONTAINER,
+            prevCount: currentTurnCount,
           }
         );
 
@@ -662,46 +737,43 @@ export class AiStudioProvider extends WebAiProvider {
           errorAttempt++;
           if (errorAttempt > maxModelErrorRetries) {
             console.error(`[AI Studio] Worker #${id} Model error persisted after ${maxModelErrorRetries} retries.`);
+            const fallbackErrMsg = await page.evaluate((sel: string) => {
+              const err = document.querySelector(sel) as HTMLElement | null;
+              return err ? (err.innerText || err.textContent || '').replace(/^error\s*/i, '').trim() : '';
+            }, this.selectors.MODEL_ERROR).catch(() => '');
+
+            finalMainText = fallbackErrMsg || 'An internal error occurred while generating response in AI Studio.';
             break;
           }
 
           console.warn(
-            `[AI Studio] Worker #${id} 遇到錯誤「Permission denied / Model error」。等待 2 秒後重試 (${errorAttempt}/${maxModelErrorRetries})...`
+            `[AI Studio] Worker #${id} 遇到可恢復錯誤（internal error / Permission denied）。等待 2 秒後重新填入並發送最後的 Prompt (${errorAttempt}/${maxModelErrorRetries})...`
           );
           await page.waitForTimeout(2000);
+          await this.dismissAllDialogs(page);
 
-          // 優先點擊該回合專屬的 rerun-button (Rerun this turn)
-          const rerunBtn = page
-            .locator(this.selectors.MODEL_TURN)
-            .last()
-            .locator(this.selectors.RERUN_BUTTON)
-            .first();
+          currentTurnCount = await page.locator(this.selectors.MODEL_TURN).count();
+          console.log(`[AI Studio] Worker #${id} 重發 Prompt 前 Model Turn 總數: ${currentTurnCount}`);
 
-          let retryTriggered = false;
-          if (await rerunBtn.isVisible({ timeout: 2000 }).catch(() => false) || (await rerunBtn.count()) > 0) {
-            console.log(`[AI Studio] Worker #${id} 點擊 rerun-button (Rerun this turn)...`);
-            await rerunBtn.scrollIntoViewIfNeeded().catch(() => {});
-            await rerunBtn.click({ force: true, timeout: 2000 }).catch(() => {});
-            retryTriggered = true;
-          }
+          await submitPrompt();
 
-          if (!retryTriggered) {
-            // 兜底：嘗試點擊主 Run 按鈕
-            const mainRunBtn = page.locator(this.selectors.RUN_BUTTON).first();
-            if (await mainRunBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              console.log(`[AI Studio] Worker #${id} 點擊主 Run 按鈕重試...`);
-              await mainRunBtn.click({ timeout: 2000 }).catch(() => {});
-              retryTriggered = true;
-            }
-          }
+          await page.waitForFunction(
+            ({ turnSelector, prevCount }: WaitForTurnParams) => {
+              const turns = document.querySelectorAll(turnSelector);
+              return turns.length > prevCount;
+            },
+            {
+              turnSelector: this.selectors.MODEL_TURN,
+              prevCount: currentTurnCount,
+            },
+            { timeout: 30000 }
+          );
 
-          // 重置累積文字，等待模型開始重新生成
+          console.log(`[AI Studio] Worker #${id} 重發後檢測到全新 Model Turn，重新進入觀察...`);
           rawFullMainText = '';
-          await page.waitForTimeout(1000);
           continue;
         }
 
-        // 成功取得正常回應，跳出循環
         break;
       }
     } finally {
