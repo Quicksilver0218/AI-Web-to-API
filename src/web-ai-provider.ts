@@ -23,9 +23,23 @@ export interface ExtractToolCallsResult {
   parseErrors: Array<{ rawJson: string; error: string }>;
 }
 
+export interface ExecuteChatOptions {
+  worker: PageWorker;
+  messages: ChatMessage[];
+  isNewConversation: boolean;
+  targetPath?: string;
+  tools?: OpenAiTool[];
+  thinkingLevel?: string;
+  abortSignal?: AbortSignal;
+  onTextDelta?: (delta: string) => void;
+  onReasoningDelta?: (delta: string) => void;
+}
+
 export abstract class WebAiProvider {
   abstract readonly name: string;
   abstract readonly baseUrl: string;
+
+  protected readonly dirtyPages = new WeakSet<Page>();
 
   abstract uploadFile(page: Page, filePath: string): Promise<void>;
 
@@ -39,8 +53,44 @@ export abstract class WebAiProvider {
     worker: PageWorker,
     prompt: string,
     onRawChunk: (delta: string, isReasoning?: boolean) => void,
-    options?: { thinkingLevel?: string },
+    options?: { thinkingLevel?: string; abortSignal?: AbortSignal }
   ): Promise<{ rawText: string; currentPath: string }>;
+
+  abstract stop(worker: PageWorker): Promise<void>;
+
+  public markPageDirty(page: Page): void {
+    this.dirtyPages.add(page);
+  }
+
+  /**
+   * 核心修復：使任意 Playwright 操作能立即響應 abortSignal 中斷，不再無腦等待其結束
+   */
+  protected async withAbortCheck<T>(
+    promise: Promise<T>,
+    signal?: AbortSignal,
+    stepName = 'operation'
+  ): Promise<T> {
+    if (signal?.aborted) {
+      throw new Error(`Aborted before ${stepName}`);
+    }
+    if (!signal) return promise;
+
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(new Error(`Aborted during ${stepName}`));
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      promise.then(
+        (val) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(val);
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      );
+    });
+  }
 
   protected parseMcpTool(item: OpenAiTool): ParsedMcpMetadata {
     const fn = item.function || item;
@@ -114,7 +164,14 @@ export abstract class WebAiProvider {
     }
 
     const lastMsg = messages[messages.length - 1];
-    return typeof lastMsg?.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg?.content ?? '');
+    let lastText = typeof lastMsg?.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg?.content ?? '');
+
+    const inputMatch = lastText.match(/<user_input[^>]*>([\s\S]*?)<\/user_input>/i);
+    if (inputMatch && inputMatch[1].trim()) {
+      lastText = inputMatch[1].trim();
+    }
+
+    return lastText;
   }
 
   protected resolveExactToolName(parsedToolName: string, tools?: OpenAiTool[]): string {
@@ -276,16 +333,7 @@ export abstract class WebAiProvider {
     return { cleanContent: cleanContent.trim(), toolCalls, parseErrors };
   }
 
-  public async executeChat(params: {
-    worker: PageWorker;
-    messages: ChatMessage[];
-    isNewConversation: boolean;
-    targetPath?: string;
-    tools?: OpenAiTool[];
-    thinkingLevel?: string;
-    onTextDelta?: (delta: string) => void;
-    onReasoningDelta?: (delta: string) => void;
-  }): Promise<ChatExecutionResult> {
+  public async executeChat(params: ExecuteChatOptions): Promise<ChatExecutionResult> {
     const {
       worker,
       messages,
@@ -293,19 +341,59 @@ export abstract class WebAiProvider {
       targetPath,
       tools,
       thinkingLevel,
+      abortSignal,
       onTextDelta,
       onReasoningDelta,
     } = params;
 
-    await this.navigateConversation(worker.page, isNewConversation, targetPath);
+    if (abortSignal?.aborted) {
+      this.dirtyPages.add(worker.page);
+      throw new Error('Chat generation aborted before navigation');
+    }
+
+    // 競爭保護：若在導覽中斷連線，立即丟出例外中止流程
+    await this.withAbortCheck(
+      this.navigateConversation(worker.page, isNewConversation, targetPath),
+      abortSignal,
+      'navigation'
+    );
+
+    if (abortSignal?.aborted) {
+      this.dirtyPages.add(worker.page);
+      throw new Error('Chat generation aborted after navigation');
+    }
 
     let promptToSend = '';
     let tempFilePath: string | null = null;
 
     try {
       if (isNewConversation) {
-        const systemMsg = messages.find((m) => m.role === 'system')?.content ?? '';
-        const userMsg = messages.filter((m) => m.role === 'user')[0]?.content ?? '';
+        const systemMsg = messages
+          .filter((m) => m.role === 'system')
+          .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+          .join('\n\n');
+
+        const userMsgs = messages.filter((m) => m.role === 'user');
+        const realUserPrompts = userMsgs
+          .map((m) => {
+            let t = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+            const inputMatch = t.match(/<user_input[^>]*>([\s\S]*?)<\/user_input>/i);
+            if (inputMatch && inputMatch[1].trim()) t = inputMatch[1].trim();
+            return t
+              .replace(/\[TASK RESUMPTION\][\s\S]*$/i, '')
+              .replace(/\[Task Resumed\][\s\S]*$/i, '')
+              .trim();
+          })
+          .filter((txt) => txt.length > 0);
+
+        let userTask = '';
+        if (realUserPrompts.length > 0) {
+          userTask = realUserPrompts.join('\n\n');
+        } else if (userMsgs.length > 0) {
+          userTask = typeof userMsgs[0].content === 'string' ? userMsgs[0].content : JSON.stringify(userMsgs[0].content);
+        } else {
+          userTask = 'Please proceed with the task.';
+        }
 
         const fileContent = this.buildToolsAndSystemFileContent(systemMsg, tools);
 
@@ -315,9 +403,25 @@ export abstract class WebAiProvider {
         );
         await fs.writeFile(tempFilePath, fileContent, 'utf8');
 
-        await this.uploadFile(worker.page, tempFilePath);
+        if (abortSignal?.aborted) {
+          this.dirtyPages.add(worker.page);
+          throw new Error('Chat generation aborted before file upload');
+        }
 
-        promptToSend = `I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.\nPlease read the rules and tool definitions in the attachment carefully.\n[CRITICAL EXECUTION RULES]: When you need to call a tool, directly output @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}} in plain text. Paths MUST strictly use forward slashes (/), and NEVER wrap it inside markdown code blocks.\nPlease execute the following task:\n\n${userMsg}`;
+        // 競爭保護：若在上傳過程中斷連線，立即中止流程
+        await this.withAbortCheck(
+          this.uploadFile(worker.page, tempFilePath),
+          abortSignal,
+          'file upload'
+        );
+        this.dirtyPages.add(worker.page);
+
+        if (abortSignal?.aborted) {
+          this.dirtyPages.add(worker.page);
+          throw new Error('Chat generation aborted after file upload');
+        }
+
+        promptToSend = `I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.\nPlease read the rules and tool definitions in the attachment carefully.\n[CRITICAL EXECUTION RULES]: When you need to call a tool, directly output @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}} in plain text. Paths MUST strictly use forward slashes (/), and NEVER wrap it inside markdown code blocks.\nPlease execute the following task:\n\n${userTask}`;
       } else {
         promptToSend = this.formatContinuationPrompt(messages);
       }
@@ -326,6 +430,11 @@ export abstract class WebAiProvider {
       let retryCount = 0;
 
       while (true) {
+        if (abortSignal?.aborted) {
+          this.dirtyPages.add(worker.page);
+          throw new Error('Chat generation aborted before prompt submission');
+        }
+
         console.log(
           `[${this.name}] Worker #${worker.id} sending message (${
             isNewConversation && retryCount === 0 ? 'new session' : 'continuation'
@@ -381,12 +490,13 @@ export abstract class WebAiProvider {
           worker,
           promptToSend,
           handleRawChunk,
-          { thinkingLevel }
+          { thinkingLevel, abortSignal }
         );
+
+        this.dirtyPages.add(worker.page);
 
         const { cleanContent, toolCalls, parseErrors } = this.extractToolCalls(rawText, tools);
 
-        // 當工具調用 JSON 解析失敗且未取得任何合法 tool call 時，發送提示要求模型修正重發
         if (parseErrors.length > 0 && toolCalls.length === 0 && retryCount < maxParseRetries) {
           retryCount++;
           const errorDetails = parseErrors

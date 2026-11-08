@@ -11,6 +11,7 @@ interface ObserveStreamParams {
   turnSelector: string;
   scrollSelector: string;
   stopSelector: string;
+  isModelRunningCode: string;
   prevSnapshot: number;
 }
 
@@ -20,8 +21,15 @@ interface ObserveResult {
 }
 
 /**
- * 獨立抽出的 AI Studio 專屬彈窗關閉模組
+ * 統一的運行狀態判斷函式（瀏覽器環境執行）
  */
+function isModelRunning(stopSelector: string): boolean {
+  const btn = document.querySelector(stopSelector) as HTMLElement | null;
+  if (!btn || btn.offsetParent === null) return false;
+  const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+  return text.includes('stop');
+}
+
 async function dismissAiStudioDialogs(page: Page): Promise<void> {
   const dialogSelectors = [
     '#g1-welcome-dialog button[aria-label="Close dialog"], ms-g1-welcome-dialog button.ms-button-primary, #g1-welcome-dialog button:has-text("Continue")',
@@ -34,7 +42,7 @@ async function dismissAiStudioDialogs(page: Page): Promise<void> {
     try {
       const btn = page.locator(selector).first();
       if (await btn.isVisible({ timeout: 400 }).catch(() => false)) {
-        await btn.click({ timeout: 1000 }).catch(() => {});
+        await btn.click({ timeout: 1000 }).catch(() => { });
       }
     } catch {
       // 忽略單一彈窗檢查例外
@@ -46,15 +54,13 @@ export class AiStudioProvider extends WebAiProvider {
   readonly name = 'aistudio';
   readonly baseUrl = 'https://aistudio.google.com/prompts/new_chat';
 
-  private readonly hasChattedPages = new WeakSet<Page>();
+  private readonly stoppingPromises = new WeakMap<Page, Promise<void>>();
 
   private readonly selectors = {
     PROMPT_INPUT:
       'ms-prompt-input-wrapper textarea, ms-autosize-textarea textarea, textarea[aria-label*="Type something"], textarea',
-    SEND_BUTTON:
-      'ms-run-button button:not([disabled]), button.run-button:not([disabled]), button[aria-label*="Run"]:not([disabled])',
-    STOP_BUTTON:
-      'ms-run-button button.stop, ms-run-button button[aria-label*="Stop"], button.stop-button',
+    SEND_OR_STOP_BUTTON:
+      'ms-run-button button:not([disabled])[mattooltipclass="run-button-tooltip"].ms-button-primary',
     ADD_CHUNK_BUTTON:
       'ms-add-chunk-menu button, button[aria-label*="Insert"], button[aria-label*="Add"]',
     UPLOAD_FILE_MENU_ITEM:
@@ -73,6 +79,40 @@ export class AiStudioProvider extends WebAiProvider {
     THINKING_PANEL: '.mat-mdc-select-panel[aria-label="Thinking Level"], .mat-mdc-select-panel',
     SCROLL_CONTAINER: 'ms-autoscroll-container',
   } as const;
+
+  public async stop(worker: PageWorker): Promise<void> {
+    const existing = this.stoppingPromises.get(worker.page);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = (async () => {
+      try {
+        this.dirtyPages.add(worker.page);
+        console.log(`[AI Studio] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
+
+        // 等待外部統一的 isAiStudioRunning 成立（最多 5 秒）
+        await worker.page.waitForFunction(
+          isModelRunning,
+          this.selectors.SEND_OR_STOP_BUTTON,
+          { timeout: 5000 }
+        );
+
+        console.log(`[AI Studio] Worker #${worker.id} model confirmed running. Clicking SEND_OR_STOP_BUTTON...`);
+        const stopBtn = worker.page.locator(this.selectors.SEND_OR_STOP_BUTTON).first();
+        await stopBtn.click({ timeout: 2000 });
+      } catch (err) {
+        console.warn(`[AI Studio] Worker #${worker.id} stop execution warning:`, err);
+      }
+    })();
+
+    this.stoppingPromises.set(worker.page, promise);
+    try {
+      await promise;
+    } finally {
+      this.stoppingPromises.delete(worker.page);
+    }
+  }
 
   public mapThinkingLevel(effort?: string): 'Low' | 'Medium' | 'High' | null {
     if (!effort) return null;
@@ -104,7 +144,7 @@ export class AiStudioProvider extends WebAiProvider {
       }
 
       console.log(`[AI Studio] Changing Thinking Level from "${currentVal}" to "${targetLevel}"...`);
-      await selectLocator.scrollIntoViewIfNeeded().catch(() => {});
+      await selectLocator.scrollIntoViewIfNeeded().catch(() => { });
       await selectLocator.click({ timeout: 2000 });
 
       const optionLocator = page
@@ -116,30 +156,27 @@ export class AiStudioProvider extends WebAiProvider {
         await optionLocator.click({ timeout: 2000 });
         console.log(`[AI Studio] Successfully applied Thinking Level: "${targetLevel}"`);
       } else {
-        await page.keyboard.press('Escape').catch(() => {});
+        await page.keyboard.press('Escape').catch(() => { });
       }
 
       await page.waitForSelector('.cdk-overlay-pane:has(mat-option)', { state: 'detached', timeout: 1500 }).catch(async () => {
-        await page.keyboard.press('Escape').catch(() => {});
+        await page.keyboard.press('Escape').catch(() => { });
       });
     } catch (err) {
       console.warn('[AI Studio] setThinkingLevel error:', err);
-      await page.keyboard.press('Escape').catch(() => {});
+      await page.keyboard.press('Escape').catch(() => { });
     }
   }
 
   public async ensureRawModeEnabled(page: Page): Promise<void> {
     try {
-      const moreActionsLocator = page.locator(this.selectors.VIEW_MORE_ACTIONS_BUTTON);
-      if ((await moreActionsLocator.count()) === 0) return;
-
-      const moreActionsBtn = moreActionsLocator.last();
+      const moreActionsBtn = page.locator(this.selectors.VIEW_MORE_ACTIONS_BUTTON)
       await moreActionsBtn.waitFor({ state: 'visible', timeout: 2000 });
-      await moreActionsBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await moreActionsBtn.scrollIntoViewIfNeeded().catch(() => { });
       await moreActionsBtn.click({ timeout: 2000 });
 
       const rawModeBtn = page.locator(this.selectors.RAW_MODE_BUTTON).first();
-      await rawModeBtn.waitFor({ state: 'visible', timeout: 2500 });
+      await rawModeBtn.waitFor({ state: 'visible', timeout: 2000 });
 
       const checkmarkInBtn = rawModeBtn.locator(this.selectors.RAW_MODE_CHECKMARK);
       const globalCheckmark = page.locator(this.selectors.RAW_MODE_CHECKMARK);
@@ -152,11 +189,11 @@ export class AiStudioProvider extends WebAiProvider {
         console.log('[AI Studio] Checkmark not found. Enabling Raw Mode...');
         await rawModeBtn.click({ timeout: 2000 });
       } else {
-        await page.keyboard.press('Escape').catch(() => {});
+        await page.keyboard.press('Escape').catch(() => { });
       }
     } catch (err) {
       console.warn('[AI Studio] ensureRawModeEnabled notice:', err);
-      await page.keyboard.press('Escape').catch(() => {});
+      await page.keyboard.press('Escape').catch(() => { });
     }
   }
 
@@ -193,17 +230,24 @@ export class AiStudioProvider extends WebAiProvider {
     targetPath?: string
   ): Promise<void> {
     if (isNewConversation) {
-      const hasChattedInSession = this.hasChattedPages.has(page);
       const existingTurns = await page.locator(this.selectors.CHAT_TURN).count().catch(() => 0);
+      const hasInputText = await page.evaluate((sel: string) => {
+        const el = document.querySelector(sel) as HTMLTextAreaElement | null;
+        return el ? el.value.trim().length > 0 : false;
+      }, this.selectors.PROMPT_INPUT).catch(() => false);
+      const hasUploadedFiles = await page.locator('ms-prompt-chunk, ms-file-chunk').count().catch(() => 0);
 
-      if (hasChattedInSession || existingTurns > 0) {
-        console.log(`[AI Studio] Resetting page for new session...`);
+      const isDirty = this.dirtyPages.has(page) || existingTurns > 0 || hasInputText || hasUploadedFiles > 0;
+
+      if (isDirty) {
+        console.log(`[AI Studio] Page is dirty or starting new session. Force reloading to baseUrl...`);
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
-        this.hasChattedPages.delete(page);
+        this.dirtyPages.delete(page);
       }
       await dismissAiStudioDialogs(page);
       await this.ensureRawModeEnabled(page);
     } else {
+      console.log(`[AI Studio] Continuing in existing conversation tab (no reload).`);
       await dismissAiStudioDialogs(page);
     }
   }
@@ -217,14 +261,23 @@ export class AiStudioProvider extends WebAiProvider {
     await input.waitFor({ state: 'visible', timeout: 20000 });
 
     await input.click();
+
+    await input.evaluate((el: HTMLTextAreaElement) => {
+      el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }).catch(() => { });
     await input.fill('');
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => { });
+    await page.keyboard.press('Backspace').catch(() => { });
+
     await input.fill(prompt);
     await input.dispatchEvent('input');
     await input.dispatchEvent('change');
 
     await dismissAiStudioDialogs(page);
 
-    const sendBtn = page.locator(this.selectors.SEND_BUTTON).first();
+    const sendBtn = page.locator(this.selectors.SEND_OR_STOP_BUTTON).first();
     let sent = false;
 
     try {
@@ -242,13 +295,11 @@ export class AiStudioProvider extends WebAiProvider {
       await page.keyboard.press('Enter');
     }
 
-    this.hasChattedPages.add(page);
-
     await page.waitForTimeout(600);
     const remainingVal = await input.inputValue().catch(() => '');
     if (remainingVal.trim().length > 0) {
       console.log('[AI Studio] Prompt remaining in input box, executing forced submit...');
-      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => { });
       await input.focus();
       await page.keyboard.press('Enter');
     }
@@ -258,13 +309,18 @@ export class AiStudioProvider extends WebAiProvider {
     worker: PageWorker,
     prompt: string,
     onRawChunk: (delta: string, isReasoning?: boolean) => void,
-    options?: { thinkingLevel?: string }
+    options?: { thinkingLevel?: string; abortSignal?: AbortSignal }
   ): Promise<{ rawText: string; currentPath: string }> {
     const { page, emitter, id } = worker;
     const currentUrlObj = new URL(page.url());
     const currentPath = currentUrlObj.pathname;
 
     try {
+      if (options?.abortSignal?.aborted) {
+        this.dirtyPages.add(page);
+        throw new Error('Chat generation aborted before prompt submission.');
+      }
+
       await dismissAiStudioDialogs(page);
       await this.setThinkingLevel(page, options?.thinkingLevel);
 
@@ -273,7 +329,6 @@ export class AiStudioProvider extends WebAiProvider {
 
       await this.submitPrompt(page, prompt);
 
-      // 發送後立即執行一次雙軌置底
       await page
         .evaluate((scrollSelector: string) => {
           const scrollTarget = document.querySelector(
@@ -288,7 +343,7 @@ export class AiStudioProvider extends WebAiProvider {
             scroller.scrollTop = scroller.scrollHeight;
           }
         }, this.selectors.SCROLL_CONTAINER)
-        .catch(() => {});
+        .catch(() => { });
 
       await page.waitForFunction(
         ({ turnSelector, prevSnapshot }: WaitForTurnParams) => {
@@ -332,10 +387,27 @@ export class AiStudioProvider extends WebAiProvider {
 
       try {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
-          const evalResult: ObserveResult = await page.evaluate(
-            ({ turnSelector, scrollSelector, stopSelector, prevSnapshot }: ObserveStreamParams) => {
+          if (options?.abortSignal?.aborted) {
+            await this.stop(worker);
+            finalMainText = '[Generation Aborted by Client]';
+            break;
+          }
+
+          const evalPromise = page.evaluate(
+            ({ turnSelector, scrollSelector, stopSelector, isModelRunningCode, prevSnapshot }: ObserveStreamParams) => {
               return new Promise<ObserveResult>((resolve) => {
                 const customWindow = window as unknown as WindowWithCustomEvents;
+
+                // 從傳入的程式碼字串還原出統一的 isModelRunning 函式
+                const scriptContent = 'return (' + isModelRunningCode + ')';
+                const fn = new Function(
+                  window.trustedTypes ?
+                    window.trustedTypes.createPolicy('evalPolicy', {
+                      createScript: (scriptString: string) => scriptString
+                    }).createScript(scriptContent) as unknown as string :
+                    scriptContent
+                )();
+                const isModelRunning = (): boolean => fn(stopSelector);
 
                 function scrollToBottom(): void {
                   const scrollTarget = document.querySelector(
@@ -372,31 +444,13 @@ export class AiStudioProvider extends WebAiProvider {
                   return turns[turns.length - 1];
                 }
 
-                function isModelRunning(): boolean {
-                  const runButtonEl = document.querySelector('ms-run-button');
-                  if (!runButtonEl) return false;
-
-                  if (
-                    runButtonEl.querySelector(
-                      '.stop, .spin, mat-spinner, mat-progress-spinner, [aria-label*="Stop" i], [aria-label*="Cancel" i]'
-                    )
-                  ) {
+                function clickStopButton(): boolean {
+                  const btn = document.querySelector(stopSelector) as HTMLElement | null;
+                  if (btn && btn.offsetParent !== null && isModelRunning()) {
+                    btn.click();
                     return true;
                   }
-
-                  const btn = runButtonEl.querySelector('button');
-                  if (!btn) return false;
-
-                  const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                  const txt = (btn.textContent || '').trim().toLowerCase();
-
-                  return (
-                    aria.includes('stop') ||
-                    aria.includes('cancel') ||
-                    txt.includes('stop') ||
-                    txt.includes('cancel') ||
-                    (btn.disabled && !txt.includes('run'))
-                  );
+                  return false;
                 }
 
                 function hasCompleteToolCall(raw: string): boolean {
@@ -576,7 +630,7 @@ export class AiStudioProvider extends WebAiProvider {
                   if (isDone) return;
                   isDone = true;
 
-                  clearInterval(pollInterval);
+                  clearInterval(intervalTimer);
                   clearInterval(scrollInterval);
 
                   if (status === 'done') {
@@ -584,7 +638,7 @@ export class AiStudioProvider extends WebAiProvider {
                     if (finalThought.length > lastThoughtLen) {
                       const thoughtDelta = finalThought.slice(lastThoughtLen);
                       lastThoughtLen = finalThought.length;
-                      await customWindow.__pushChunk(
+                      customWindow.__pushChunk(
                         JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
                       );
                     }
@@ -593,23 +647,22 @@ export class AiStudioProvider extends WebAiProvider {
                     if (finalMain.length > lastMainLen) {
                       const mainDelta = finalMain.slice(lastMainLen);
                       lastMainLen = finalMain.length;
-                      await customWindow.__pushChunk(
+                      customWindow.__pushChunk(
                         JSON.stringify({ type: 'content', delta: mainDelta })
                       );
                     }
                   }
 
-                  await customWindow.__pushDone();
+                  customWindow.__pushDone();
                   resolve({ status, text });
                 }
 
-                const pollInterval = window.setInterval(async () => {
+                const intervalTimer = window.setInterval(async () => {
                   if (isDone) return;
 
                   const turn = getLatestTurn();
                   const running = isModelRunning();
 
-                  // 錯誤判定
                   if (!running && turn) {
                     const errorMsg = getModelErrorText(turn);
                     if (errorMsg) {
@@ -626,33 +679,27 @@ export class AiStudioProvider extends WebAiProvider {
                   emitDelta();
 
                   const currentMain = getMainText();
+                  const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
 
-                  // 完整工具呼叫輸出
+                  // 情況 1：已輸出完整 MCP 工具呼叫
                   if (!running && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
                     void finish('done', currentMain);
                     return;
                   }
 
-                  // 停止且已有正文輸出
-                  if (!running && lastMainLen > 0 && Date.now() - lastChangeTime > 1500) {
+                  // 情況 2：兜底保險（停止運作且靜止超過 1 秒）
+                  if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1000) {
                     void finish('done', currentMain);
                     return;
                   }
 
-                  // 正常生成後的靜默保險
-                  if (lastMainLen > 0 && Date.now() - lastChangeTime > 15000) {
-                    void finish('done', currentMain);
-                    return;
-                  }
-
-                  // 45 秒超時邏輯：點擊停止按鈕並返回超時提示
+                  // 情況 3：45 秒超時
                   if (Date.now() - lastChangeTime > 45000) {
-                    const stopBtn = document.querySelector(stopSelector) as HTMLElement | null;
-                    if (stopBtn) stopBtn.click();
+                    clickStopButton();
                     void finish('timeout', '[Generation Timeout]: No response received within 45 seconds.');
                     return;
                   }
-                }, 250);
+                }, 200);
 
                 emitDelta();
               });
@@ -660,14 +707,35 @@ export class AiStudioProvider extends WebAiProvider {
             {
               turnSelector: this.selectors.TURN_ITEM,
               scrollSelector: this.selectors.SCROLL_CONTAINER,
-              stopSelector: this.selectors.STOP_BUTTON,
+              stopSelector: this.selectors.SEND_OR_STOP_BUTTON,
+              isModelRunningCode: isModelRunning.toString(),
               prevSnapshot: turnSnapshot,
             }
           );
 
+          const abortPromise = new Promise<ObserveResult>((resolve) => {
+            if (options?.abortSignal?.aborted) {
+              resolve({ status: 'timeout', text: '[Generation Aborted by Client]' });
+              return;
+            }
+            options?.abortSignal?.addEventListener(
+              'abort',
+              () => resolve({ status: 'timeout', text: '[Generation Aborted by Client]' }),
+              { once: true }
+            );
+          });
+
+          const evalResult = await Promise.race([evalPromise, abortPromise]);
+
+          if (options?.abortSignal?.aborted || evalResult.status === 'timeout') {
+            await this.stop(worker);
+            finalMainText = evalResult.text;
+            break;
+          }
+
           if (evalResult.status === 'retryable_error') {
             console.warn(
-              `[AI Studio] Worker #${id} 遇到可重試錯誤（${evalResult.text}）。等待 2 秒後重發 (${attempt}/${maxRetries})...`
+              `[AI Studio] Worker #${id} Retryable error occurred (${evalResult.text}). Retry after 2 seconds (${attempt}/${maxRetries})...`
             );
             await page.waitForTimeout(2000);
             await dismissAiStudioDialogs(page);
@@ -712,6 +780,7 @@ export class AiStudioProvider extends WebAiProvider {
       console.log(`[AI Studio] Worker #${id} generation completed. Total main chars: ${resolvedText.length}`);
       return { rawText: resolvedText, currentPath };
     } catch (err) {
+      this.dirtyPages.add(page);
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error(`[AI Studio] Worker #${id} unexpected error:`, errorMsg);
       return {
