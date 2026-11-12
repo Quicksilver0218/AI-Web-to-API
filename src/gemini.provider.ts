@@ -2,25 +2,42 @@ import type { Page } from 'playwright';
 import { WebAiProvider } from './web-ai-provider.js';
 import type { PageWorker, WindowWithCustomEvents } from './types.ts';
 
-interface BrowserEvaluateParams {
-  selector: string;
-  index: number;
-  stopSelector: string;
-  thinkSelector: string;
+interface WaitForTurnParams {
+  turnSelector: string;
+  prevSnapshot: number;
 }
 
-interface WaitForFunctionParams {
-  selector: string;
-  count: number;
+interface ObserveStreamParams {
+  turnSelector: string;
+  targetIndex: number;
+  stopSelector: string;
+  thinkSelector: string;
+  isModelRunningCode: string;
+}
+
+interface ObserveResult {
+  status: 'done' | 'timeout';
+  text: string;
+}
+
+/**
+ * 統一的運行狀態判斷函式（瀏覽器環境執行）
+ */
+function isModelRunning(stopSelector: string): boolean {
+  const btn = document.querySelector(stopSelector) as HTMLElement | null;
+  return btn !== null && btn.offsetParent !== null;
 }
 
 export class GeminiProvider extends WebAiProvider {
   readonly name = 'gemini';
   readonly baseUrl = 'https://gemini.google.com/app';
 
+  private readonly stoppingPromises = new WeakMap<Page, Promise<void>>();
+
   private readonly selectors = {
     PROMPT_INPUT: 'div[contenteditable="true"], div.ql-editor',
-    SEND_BUTTON: 'button[aria-label*="傳送"], button[aria-label*="Send"]',
+    SEND_BUTTON:
+      'button[aria-label*="傳送"]:not([disabled]):not([aria-disabled="true"]), button[aria-label*="Send"]:not([disabled]):not([aria-disabled="true"])',
     STOP_BUTTON: 'button[aria-label*="停止"], button[aria-label*="Stop"]',
     RESPONSE_CONTAINER: 'message-content, .model-response-text, [data-test-id="model-turn"]',
     THINK_CONTAINER:
@@ -38,6 +55,45 @@ export class GeminiProvider extends WebAiProvider {
     SUBMENU_CONTAINER: '.submenu-container, .cdk-overlay-popover',
   } as const;
 
+  public async isModelRunning(page: Page): Promise<boolean> {
+    return await page
+      .evaluate(isModelRunning, this.selectors.STOP_BUTTON)
+      .catch(() => false);
+  }
+
+  public async stop(worker: PageWorker): Promise<void> {
+    const existing = this.stoppingPromises.get(worker.page);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = (async () => {
+      try {
+        this.dirtyPages.add(worker.page);
+        console.log(`[${this.name}] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
+
+        await worker.page.waitForFunction(
+          isModelRunning,
+          this.selectors.STOP_BUTTON,
+          { timeout: 5000 }
+        );
+
+        console.log(`[${this.name}] Worker #${worker.id} model confirmed running. Clicking STOP_BUTTON...`);
+        const stopBtn = worker.page.locator(this.selectors.STOP_BUTTON).first();
+        await stopBtn.click({ timeout: 2000 });
+      } catch (err) {
+        console.warn(`[${this.name}] Worker #${worker.id} stop execution warning:`, err);
+      }
+    })();
+
+    this.stoppingPromises.set(worker.page, promise);
+    try {
+      await promise;
+    } finally {
+      this.stoppingPromises.delete(worker.page);
+    }
+  }
+
   public mapThinkingLevel(effort?: string): 'Low' | 'Medium' | 'High' | null {
     if (!effort) return null;
     const normalized = effort.trim().toLowerCase().replace(/[-_]/g, '');
@@ -49,10 +105,10 @@ export class GeminiProvider extends WebAiProvider {
     return null;
   }
 
-  /**
-   * 完整設置 Thinking Level，並確保所有浮動選單已完全關閉
-   */
-  public async setThinkingLevel(page: Page, targetLevel: 'Low' | 'Medium' | 'High'): Promise<void> {
+  public async setThinkingLevel(page: Page, level?: string): Promise<void> {
+    const targetLevel = this.mapThinkingLevel(level);
+    if (!targetLevel) return;
+
     try {
       const levelMap: Record<'Low' | 'Medium' | 'High', { label: string; regex: RegExp }> = {
         Low: { label: '低', regex: /^(低|low)$/i },
@@ -63,44 +119,37 @@ export class GeminiProvider extends WebAiProvider {
 
       const pickerBtn = page.locator(this.selectors.MODEL_PICKER_BUTTON).first();
       if (!(await pickerBtn.isVisible({ timeout: 2500 }).catch(() => false))) {
-        console.log('[Gemini] Model picker button not found, skipping thinking level setting.');
+        console.log('[${this.name}] Model picker button not found, skipping thinking level setting.');
         return;
       }
 
-      // 1. 檢查目前按鈕上的副文字（如「高」、「中」、「低」），若已符合則不重複展開
       const secondaryTextEl = pickerBtn.locator(this.selectors.PICKER_SECONDARY_TEXT).first();
       if (await secondaryTextEl.isVisible({ timeout: 1000 }).catch(() => false)) {
         const currentText = (await secondaryTextEl.innerText().catch(() => '')).trim();
         if (target.regex.test(currentText)) {
-          console.log(`[Gemini] Thinking Level already set to "${currentText}". Skipping menu open.`);
+          console.log(`[${this.name}] Thinking Level already set to "${currentText}". Skipping menu open.`);
           return;
         }
       }
 
-      console.log(`[Gemini] Switching Thinking Level to "${target.label}" (${targetLevel})...`);
+      console.log(`[${this.name}] Switching Thinking Level to "${target.label}" (${targetLevel})...`);
 
-      // 2. 點擊開啟模式選擇器選單
       await pickerBtn.scrollIntoViewIfNeeded().catch(() => {});
       await pickerBtn.click({ timeout: 2000 });
       await page.waitForTimeout(400);
 
-      // 3. 定位「思考水平」主選單項
-      const thinkingItem = page
-        .locator('gem-menu-item[value="thinking_level"], gem-menu-item:has-text("思考水平"), gem-menu-item:has-text("Thinking level")')
-        .first();
+      const thinkingItem = page.locator(this.selectors.THINKING_LEVEL_MENU_ITEM).first();
 
       if (!(await thinkingItem.isVisible({ timeout: 3000 }).catch(() => false))) {
-        console.warn('[Gemini] "Thinking level" (思考水平) menu item not found.');
+        console.warn('[${this.name}] "Thinking level" (思考水平) menu item not found.');
         await page.keyboard.press('Escape').catch(() => {});
         return;
       }
 
-      // 4. 懸停或點擊展開子選單
       await thinkingItem.hover().catch(() => {});
       await thinkingItem.click({ timeout: 1500 }).catch(() => {});
       await page.waitForTimeout(400);
 
-      // 5. 在子選單中嚴格比對 .label 文字（低 / 中 / 高）
       const submenuItems = page.locator('.submenu-container gem-menu-item, [role="menu"] gem-menu-item');
       const count = await submenuItems.count();
       let targetOptionLocator = null;
@@ -120,17 +169,16 @@ export class GeminiProvider extends WebAiProvider {
           (await targetOptionLocator.locator('gem-icon[aria-label*="選取"], mat-icon[data-mat-icon-name="check"]').count()) > 0;
 
         if (isSelected) {
-          console.log(`[Gemini] Option "${target.label}" is already selected.`);
+          console.log(`[${this.name}] Option "${target.label}" is already selected.`);
         } else {
-          console.log(`[Gemini] Selecting option "${target.label}"...`);
+          console.log(`[${this.name}] Selecting option "${target.label}"...`);
           await targetOptionLocator.click({ timeout: 2000 });
           await page.waitForTimeout(400);
         }
       } else {
-        console.warn(`[Gemini] Thinking level option "${target.label}" not found in submenu.`);
+        console.warn(`[${this.name}] Thinking level option "${target.label}" not found in submenu.`);
       }
 
-      // 6. 確保所有選單浮動層已關閉，避免遮擋接下來的 Prompt 輸入框
       for (let i = 0; i < 3; i++) {
         const isExpanded = (await pickerBtn.getAttribute('aria-expanded')) === 'true';
         const hasOverlay = (await page.locator('.cdk-overlay-pane:has(gem-menu)').count()) > 0;
@@ -142,16 +190,16 @@ export class GeminiProvider extends WebAiProvider {
         }
       }
 
-      console.log(`[Gemini] Thinking Level switch completed. Ready for prompt input.`);
+      console.log('[${this.name}] Thinking Level switch completed. Ready for prompt input.');
     } catch (err) {
-      console.warn('[Gemini] setThinkingLevel warning:', err);
+      console.warn('[${this.name}] setThinkingLevel warning:', err);
       await page.keyboard.press('Escape').catch(() => {});
       await page.waitForTimeout(300);
     }
   }
 
   async uploadFile(page: Page, filePath: string): Promise<void> {
-    console.log(`[Gemini] Uploading attachment file: ${filePath}`);
+    console.log(`[${this.name}] Uploading attachment file: ${filePath}`);
 
     const plusBtn = page.locator(this.selectors.PLUS_BUTTON).first();
     await plusBtn.waitFor({ state: 'visible', timeout: 15000 });
@@ -166,7 +214,7 @@ export class GeminiProvider extends WebAiProvider {
     const agreeBtn = page.locator(this.selectors.DISCLAIMER_AGREE_BUTTON).first();
     try {
       if (await agreeBtn.isVisible({ timeout: 2000 })) {
-        console.log('[Gemini] Detected first-time disclaimer dialog, clicking "Agree"...');
+        console.log('[${this.name}] Detected first-time disclaimer dialog, clicking "Agree"...');
         await agreeBtn.click();
       }
     } catch {
@@ -178,25 +226,93 @@ export class GeminiProvider extends WebAiProvider {
 
     const previewChip = page.locator(this.selectors.ATTACHMENT_PREVIEW).first();
     await previewChip.waitFor({ state: 'visible', timeout: 20000 });
-    console.log('[Gemini] Attachment successfully uploaded and mounted.');
+    console.log('[${this.name}] Attachment successfully uploaded and mounted.');
   }
 
   async navigateConversation(page: Page, isNewConversation: boolean, targetPath?: string): Promise<void> {
-    if (!isNewConversation && targetPath) {
+    if (isNewConversation) {
+      const existingTurns = await page.locator(this.selectors.RESPONSE_CONTAINER).count().catch(() => 0);
+      const hasInputText = await page.evaluate((sel: string) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        return el ? (el.innerText || el.textContent || '').trim().length > 0 : false;
+      }, this.selectors.PROMPT_INPUT).catch(() => false);
+      const hasFiles = await page.locator(this.selectors.ATTACHMENT_PREVIEW).count().catch(() => 0);
+      const currentUrlObj = new URL(page.url());
+
+      const isDirty =
+        this.dirtyPages.has(page) ||
+        existingTurns > 0 ||
+        hasInputText ||
+        hasFiles > 0 ||
+        currentUrlObj.pathname !== '/app';
+
+      if (isDirty) {
+        console.log('[${this.name}] Page is dirty or starting new session. Force reloading to baseUrl...');
+        await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
+        this.dirtyPages.delete(page);
+      }
+      return;
+    }
+
+    if (targetPath && targetPath !== '/app') {
       const currentUrlObj = new URL(page.url());
       if (currentUrlObj.pathname !== targetPath) {
         const targetFullUrl = `https://gemini.google.com${targetPath}`;
-        console.log(`[Gemini] Switching to existing conversation: ${targetFullUrl}`);
+        console.log(`[${this.name}] Switching to existing conversation: ${targetFullUrl}`);
         await page.goto(targetFullUrl, { waitUntil: 'domcontentloaded' });
       } else {
-        console.log(`[Gemini] Tab is already on target conversation (${targetPath}), continuing directly.`);
+        console.log(`[${this.name}] Tab is already on target conversation (${targetPath}), continuing directly.`);
       }
     } else {
-      const currentUrlObj = new URL(page.url());
-      if (currentUrlObj.pathname !== '/app') {
-        console.log('[Gemini] Opening new conversation home page...');
-        await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
-      }
+      console.log(`[${this.name}] Continuing in current active conversation tab (path: ${new URL(page.url()).pathname}).`);
+    }
+  }
+
+  private async getTurnSnapshot(page: Page): Promise<number> {
+    return await page.locator(this.selectors.RESPONSE_CONTAINER).count();
+  }
+
+  private async submitPrompt(page: Page, prompt: string): Promise<void> {
+    const input = page.locator(this.selectors.PROMPT_INPUT).first();
+    await input.waitFor({ state: 'visible', timeout: 15000 });
+
+    await input.click();
+    await input.evaluate((el: HTMLElement) => {
+      el.textContent = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }).catch(() => {});
+    await input.fill('');
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
+    await page.keyboard.press('Backspace').catch(() => {});
+
+    await input.fill(prompt);
+    await input.dispatchEvent('input');
+    await input.dispatchEvent('change');
+
+    const sendBtn = page.locator(this.selectors.SEND_BUTTON).first();
+    let sent = false;
+
+    try {
+      await sendBtn.waitFor({ state: 'visible', timeout: 4000 });
+      await sendBtn.click({ timeout: 2000 });
+      sent = true;
+    } catch {
+      // Fallback
+    }
+
+    if (!sent) {
+      await input.focus();
+      await page.keyboard.press('Enter');
+    }
+
+    await page.waitForTimeout(600);
+    const remainingText = await input.innerText().catch(() => '');
+    if (remainingText.trim().length > 0) {
+      console.log('[${this.name}] Prompt remaining in editor, executing forced submit...');
+      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      await input.focus();
+      await page.keyboard.press('Enter');
     }
   }
 
@@ -204,412 +320,418 @@ export class GeminiProvider extends WebAiProvider {
     worker: PageWorker,
     prompt: string,
     onRawChunk: (delta: string, isReasoning?: boolean) => void,
-    options?: { thinkingLevel?: string }
+    options?: { thinkingLevel?: string; abortSignal?: AbortSignal }
   ): Promise<{ rawText: string; currentPath: string }> {
     const { page, emitter, id } = worker;
 
-    // =========================================================================
-    // 步驟 1：先設置 Thinking Level（確保面板徹底關閉、不遮擋輸入框）
-    // =========================================================================
-    const targetLevel = this.mapThinkingLevel(options?.thinkingLevel);
-    if (targetLevel) {
-      console.log(`[Gemini] Worker #${id} setting Thinking Level before prompt: ${targetLevel}`);
-      await this.setThinkingLevel(page, targetLevel);
-      await page.waitForTimeout(400);
-    }
-
-    // =========================================================================
-    // 步驟 2：確認 Thinking Level 已就緒後，再操作輸入框與送出 Prompt
-    // =========================================================================
-    const input = page.locator(this.selectors.PROMPT_INPUT).first();
-    await input.waitFor({ state: 'visible', timeout: 15000 });
-
-    const responseLocator = page.locator(this.selectors.RESPONSE_CONTAINER);
-    const targetIndex = await responseLocator.count();
-
-    await input.click();
-    await input.fill(prompt);
-    await input.dispatchEvent('input');
-    await input.dispatchEvent('change');
-
-    const activeSendBtn = page
-      .locator(
-        'button[aria-label*="傳送"]:not([disabled]):not([aria-disabled="true"]), ' +
-          'button[aria-label*="Send"]:not([disabled]):not([aria-disabled="true"])'
-      )
-      .first();
-
-    let sent = false;
-
     try {
-      await activeSendBtn.waitFor({ state: 'visible', timeout: 4000 });
-      await activeSendBtn.click({ timeout: 2000 });
-      sent = true;
-    } catch {
-      console.log(`[Gemini] Worker #${id} active send button not ready, trying Enter key fallback...`);
-    }
-
-    if (!sent) {
-      await input.focus();
-      await input.press('Enter');
-    }
-
-    await page.waitForTimeout(600);
-    const remainingText = await input.innerText();
-    if (remainingText.trim().length > 0) {
-      console.log(`[Gemini] Worker #${id} prompt still remaining in editor, executing forced submission...`);
-      const fallbackBtn = page.locator(this.selectors.SEND_BUTTON).first();
-      try {
-        await fallbackBtn.click({ force: true, timeout: 2000 });
-      } catch {
-        await input.focus();
-        await page.keyboard.press('Enter');
+      if (options?.abortSignal?.aborted) {
+        this.dirtyPages.add(page);
+        await this.stop(worker);
+        return { rawText: '[Generation Aborted by Client]', currentPath: new URL(page.url()).pathname };
       }
-    }
 
-    await page.waitForFunction(
-      ({ selector, count }: WaitForFunctionParams) => document.querySelectorAll(selector).length > count,
-      { selector: this.selectors.RESPONSE_CONTAINER, count: targetIndex }
-    );
+      await this.setThinkingLevel(page, options?.thinkingLevel);
 
-    let rawFullMainText = '';
+      const turnSnapshot = await this.getTurnSnapshot(page);
+      console.log(`[${this.name}] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
 
-    const chunkListener = (rawPayload: string) => {
-      let type: 'reasoning' | 'content' = 'content';
-      let delta = rawPayload;
+      await this.submitPrompt(page, prompt);
 
-      try {
-        if (typeof rawPayload === 'string' && rawPayload.startsWith('{"type":')) {
-          const parsed = JSON.parse(rawPayload);
-          type = parsed.type;
-          delta = parsed.delta;
+      const abortInitialWait = new Promise<void>((_, reject) => {
+        if (options?.abortSignal?.aborted) {
+          reject(new Error('Aborted'));
+          return;
         }
-      } catch {
-        // Fallback
+        options?.abortSignal?.addEventListener('abort', () => reject(new Error('Aborted')), { once: true });
+      });
+
+      try {
+        await Promise.race([
+          page.waitForFunction(
+            ({ turnSelector, prevSnapshot }: WaitForTurnParams) =>
+              document.querySelectorAll(turnSelector).length > prevSnapshot,
+            { turnSelector: this.selectors.RESPONSE_CONTAINER, prevSnapshot: turnSnapshot },
+            { timeout: 0 }
+          ),
+          abortInitialWait,
+        ]);
+      } catch (waitErr) {
+        if (options?.abortSignal?.aborted) {
+          console.warn(`[${this.name}] Worker #${id} aborted during initial turn wait. Triggering stop...`);
+          await this.stop(worker);
+          return { rawText: '[Generation Aborted by Client]', currentPath: new URL(page.url()).pathname };
+        }
+        throw waitErr;
       }
 
-      if (type === 'reasoning') {
-        onRawChunk(delta, true);
-      } else {
-        rawFullMainText += delta;
-        onRawChunk(delta, false);
-      }
-    };
-    emitter.on('chunk', chunkListener);
+      console.log(`[${this.name}] Worker #${id} new model turn detected.`);
 
-    let finalDomText = '';
+      let rawFullMainText = '';
+      const chunkListener = (rawPayload: string) => {
+        let type: 'reasoning' | 'content' = 'content';
+        let delta = rawPayload;
 
-    try {
-      finalDomText = await page.evaluate(
-        ({ selector, index, stopSelector, thinkSelector }: BrowserEvaluateParams) => {
-          return new Promise<string>((resolve) => {
-            const container = document.querySelectorAll(selector)[index] as HTMLElement | undefined;
-            const customWindow = window as unknown as WindowWithCustomEvents;
+        try {
+          if (typeof rawPayload === 'string' && rawPayload.startsWith('{"type":')) {
+            const parsed = JSON.parse(rawPayload);
+            type = parsed.type;
+            delta = parsed.delta;
+          }
+        } catch {
+          // Fallback
+        }
 
-            function serializeCellContent(cell: Element): string {
-              const cellClone = cell.cloneNode(true) as HTMLElement;
+        if (type === 'reasoning') {
+          onRawChunk(delta, true);
+        } else {
+          rawFullMainText += delta;
+          onRawChunk(delta, false);
+        }
+      };
+      emitter.on('chunk', chunkListener);
 
-              cellClone.querySelectorAll('code').forEach((code) => {
-                code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
-              });
+      let finalMainText = '';
 
-              cellClone.querySelectorAll('strong, b').forEach((b) => {
-                b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
-              });
+      try {
+        if (options?.abortSignal?.aborted) {
+          await this.stop(worker);
+          finalMainText = '[Generation Aborted by Client]';
+        } else {
+          await this.ensureBrowserHelpers(page);
 
-              cellClone.querySelectorAll('em, i').forEach((em) => {
-                em.replaceWith(document.createTextNode(`*${em.textContent ?? ''}*`));
-              });
+          const evalPromise = page.evaluate(
+            ({ turnSelector, targetIndex, stopSelector, thinkSelector, isModelRunningCode }: ObserveStreamParams) => {
+              return new Promise<ObserveResult>((resolve) => {
+                const container = document.querySelectorAll(turnSelector)[targetIndex] as HTMLElement | undefined;
+                const customWindow = window as unknown as WindowWithCustomEvents;
+                const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
+                const checkRunning = rehydrate(isModelRunningCode);
+                const isModelRunning = (): boolean => checkRunning(stopSelector);
 
-              const raw = cellClone.textContent ?? '';
-              return raw.trim().replace(/\r?\n+/g, ' ').replace(/\|/g, '\\|');
-            }
-
-            function convertTableToMarkdown(table: HTMLTableElement): string {
-              const rows = Array.from(table.querySelectorAll('tr'));
-              if (rows.length === 0) return '';
-
-              const mdRows: string[] = [];
-              let colCount = 0;
-              let delimiterSet = false;
-              const thead = table.querySelector('thead');
-
-              for (let i = 0; i < rows.length; i++) {
-                const row = rows[i];
-                const cells = Array.from(row.querySelectorAll('th, td'));
-                if (cells.length === 0) continue;
-
-                const cellTexts = cells.map(serializeCellContent);
-                const isHeader = thead ? thead.contains(row) : i === 0;
-
-                if (isHeader) {
-                  colCount = cellTexts.length;
-                  mdRows.push(`| ${cellTexts.join(' | ')} |`);
-                  if (!delimiterSet) {
-                    mdRows.push(`| ${cellTexts.map(() => '---').join(' | ')} |`);
-                    delimiterSet = true;
+                function clickStopButton(): boolean {
+                  const btn = document.querySelector(stopSelector) as HTMLElement | null;
+                  if (btn && btn.offsetParent !== null && isModelRunning()) {
+                    btn.click();
+                    return true;
                   }
-                } else {
-                  while (colCount > 0 && cellTexts.length < colCount) {
-                    cellTexts.push('');
-                  }
-                  mdRows.push(`| ${cellTexts.join(' | ')} |`);
+                  return false;
                 }
-              }
 
-              return `\n\n${mdRows.join('\n')}\n\n`;
-            }
+                function serializeCellContent(cell: Element): string {
+                  const cellClone = cell.cloneNode(true) as HTMLElement;
 
-            function domToMarkdown(root: HTMLElement): string {
-              const clone = root.cloneNode(true) as HTMLElement;
+                  cellClone.querySelectorAll('code').forEach((code) => {
+                    code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
+                  });
 
-              clone.querySelectorAll('.katex').forEach((katex) => {
-                const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
-                const rawTex = annotation?.textContent ?? '';
-                katex.replaceWith(document.createTextNode(`$${rawTex}$`));
-              });
+                  cellClone.querySelectorAll('strong, b').forEach((b) => {
+                    b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
+                  });
 
-              clone.querySelectorAll('table').forEach((table) => {
-                const mdTable = convertTableToMarkdown(table as HTMLTableElement);
-                const wrapper =
-                  table.closest('.horizontal-scroll-wrapper') ||
-                  table.closest('table-block') ||
-                  table;
-                wrapper.replaceWith(document.createTextNode(mdTable));
-              });
+                  cellClone.querySelectorAll('em, i').forEach((em) => {
+                    em.replaceWith(document.createTextNode(`*${em.textContent ?? ''}*`));
+                  });
 
-              clone.querySelectorAll('pre').forEach((pre) => {
-                const code = pre.querySelector('code');
-                const content = (code ?? pre).textContent ?? '';
-                pre.replaceWith(document.createTextNode(`\n\`\`\`\n${content}\n\`\`\`\n`));
-              });
+                  const raw = cellClone.textContent ?? '';
+                  return raw.trim().replace(/\r?\n+/g, ' ').replace(/\|/g, '\\|');
+                }
 
-              clone.querySelectorAll('code').forEach((code) => {
-                code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
-              });
+                function convertTableToMarkdown(table: HTMLTableElement): string {
+                  const rows = Array.from(table.querySelectorAll('tr'));
+                  if (rows.length === 0) return '';
 
-              clone.querySelectorAll('b, strong').forEach((b) => {
-                b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
-              });
+                  const mdRows: string[] = [];
+                  let colCount = 0;
+                  let delimiterSet = false;
+                  const thead = table.querySelector('thead');
 
-              clone.querySelectorAll('h1').forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
-              clone.querySelectorAll('h2').forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
-              clone.querySelectorAll('h3').forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
-              clone.querySelectorAll('h4, h5, h6').forEach((h) => h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`)));
+                  for (let i = 0; i < rows.length; i++) {
+                    const row = rows[i];
+                    const cells = Array.from(row.querySelectorAll('th, td'));
+                    if (cells.length === 0) continue;
 
-              clone.querySelectorAll('li').forEach((li) => {
-                li.querySelectorAll('p').forEach((p) => {
-                  p.replaceWith(document.createTextNode(p.textContent?.trim() ?? ''));
+                    const cellTexts = cells.map(serializeCellContent);
+                    const isHeader = thead ? thead.contains(row) : i === 0;
+
+                    if (isHeader) {
+                      colCount = cellTexts.length;
+                      mdRows.push(`| ${cellTexts.join(' | ')} |`);
+                      if (!delimiterSet) {
+                        mdRows.push(`| ${cellTexts.map(() => '---').join(' | ')} |`);
+                        delimiterSet = true;
+                      }
+                    } else {
+                      while (colCount > 0 && cellTexts.length < colCount) {
+                        cellTexts.push('');
+                      }
+                      mdRows.push(`| ${cellTexts.join(' | ')} |`);
+                    }
+                  }
+
+                  return `\n\n${mdRows.join('\n')}\n\n`;
+                }
+
+                function domToMarkdown(root: HTMLElement): string {
+                  const clone = root.cloneNode(true) as HTMLElement;
+
+                  clone.querySelectorAll('.katex').forEach((katex) => {
+                    const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
+                    const rawTex = annotation?.textContent ?? '';
+                    katex.replaceWith(document.createTextNode(`$${rawTex}$`));
+                  });
+
+                  clone.querySelectorAll('table').forEach((table) => {
+                    const mdTable = convertTableToMarkdown(table as HTMLTableElement);
+                    const wrapper =
+                      table.closest('.horizontal-scroll-wrapper') ||
+                      table.closest('table-block') ||
+                      table;
+                    wrapper.replaceWith(document.createTextNode(mdTable));
+                  });
+
+                  clone.querySelectorAll('pre').forEach((pre) => {
+                    const code = pre.querySelector('code');
+                    const content = (code ?? pre).textContent ?? '';
+                    pre.replaceWith(document.createTextNode(`\n\`\`\`\n${content}\n\`\`\`\n`));
+                  });
+
+                  clone.querySelectorAll('code').forEach((code) => {
+                    code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
+                  });
+
+                  clone.querySelectorAll('b, strong').forEach((b) => {
+                    b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
+                  });
+
+                  clone.querySelectorAll('h1').forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
+                  clone.querySelectorAll('h2').forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
+                  clone.querySelectorAll('h3').forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
+                  clone.querySelectorAll('h4, h5, h6').forEach((h) => h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`)));
+
+                  clone.querySelectorAll('li').forEach((li) => {
+                    li.querySelectorAll('p').forEach((p) => {
+                      p.replaceWith(document.createTextNode(p.textContent?.trim() ?? ''));
+                    });
+                    const text = li.textContent?.trim() ?? '';
+                    li.replaceWith(document.createTextNode(`\n- ${text}\n`));
+                  });
+
+                  clone.querySelectorAll('p').forEach((p) => {
+                    const text = p.textContent?.trim() ?? '';
+                    if (text) {
+                      p.replaceWith(document.createTextNode(`\n\n${text}\n\n`));
+                    }
+                  });
+
+                  const raw = clone.textContent ?? '';
+                  return raw.replace(/\n{3,}/g, '\n\n').trim();
+                }
+
+                function getThoughtText(root: HTMLElement | undefined): string {
+                  if (!root) return '';
+                  const thinkEl = root.querySelector(thinkSelector) as HTMLElement | null;
+                  if (!thinkEl) return '';
+
+                  const clone = thinkEl.cloneNode(true) as HTMLElement;
+                  clone
+                    .querySelectorAll(
+                      'button, mat-icon, .mat-mdc-button-touch-target, [hide-from-message-actions], .thought-title, mat-expansion-panel-header'
+                    )
+                    .forEach((el) => el.remove());
+
+                  clone.querySelectorAll('h1, h2, h3, h4, p, span, div').forEach((el) => {
+                    const t = el.textContent?.trim();
+                    if (t === 'Thinking Process' || t === '思考過程' || t === 'Thinking' || t === 'Thoughts') {
+                      el.remove();
+                    }
+                  });
+
+                  return domToMarkdown(clone);
+                }
+
+                function getMainText(root: HTMLElement | undefined): string {
+                  if (!root) return '';
+                  const clone = root.cloneNode(true) as HTMLElement;
+
+                  clone
+                    .querySelectorAll(
+                      `${thinkSelector}, .table-footer, gem-icon-button, gem-popover, button, .mat-mdc-button-touch-target, [hide-from-message-actions], mat-icon`
+                    )
+                    .forEach((el) => el.remove());
+
+                  return domToMarkdown(clone);
+                }
+
+                let lastThoughtLen = 0;
+                let lastMainLen = 0;
+                let lastChangeTime = Date.now();
+                let isDone = false;
+
+                function emitDelta(): void {
+                  if (!container || isDone) return;
+
+                  const currentThought = getThoughtText(container);
+                  if (currentThought.length > lastThoughtLen) {
+                    const thoughtDelta = currentThought.slice(lastThoughtLen);
+                    lastThoughtLen = currentThought.length;
+                    lastChangeTime = Date.now();
+                    customWindow.__pushChunk(
+                      JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
+                    );
+                  }
+
+                  const currentMain = getMainText(container);
+                  if (currentMain.length > lastMainLen) {
+                    const mainDelta = currentMain.slice(lastMainLen);
+                    lastMainLen = currentMain.length;
+                    lastChangeTime = Date.now();
+                    customWindow.__pushChunk(
+                      JSON.stringify({ type: 'content', delta: mainDelta })
+                    );
+                  }
+                }
+
+                async function finish(status: ObserveResult['status'], text: string): Promise<void> {
+                  if (isDone) return;
+                  isDone = true;
+
+                  emitDelta();
+                  if (observer) observer.disconnect();
+                  if (pollInterval !== null) clearInterval(pollInterval);
+
+                  if (status === 'done' && container) {
+                    const finalThought = getThoughtText(container);
+                    if (finalThought.length > lastThoughtLen) {
+                      const thoughtDelta = finalThought.slice(lastThoughtLen);
+                      lastThoughtLen = finalThought.length;
+                      await customWindow.__pushChunk(
+                        JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
+                      );
+                    }
+
+                    const finalMain = getMainText(container);
+                    if (finalMain.length > lastMainLen) {
+                      const mainDelta = finalMain.slice(lastMainLen);
+                      lastMainLen = finalMain.length;
+                      await customWindow.__pushChunk(
+                        JSON.stringify({ type: 'content', delta: mainDelta })
+                      );
+                    }
+                  }
+
+                  await customWindow.__pushDone();
+                  resolve({ status, text });
+                }
+
+                const observer = new MutationObserver(() => {
+                  emitDelta();
                 });
-                const text = li.textContent?.trim() ?? '';
-                li.replaceWith(document.createTextNode(`\n- ${text}\n`));
-              });
 
-              clone.querySelectorAll('p').forEach((p) => {
-                const text = p.textContent?.trim() ?? '';
-                if (text) {
-                  p.replaceWith(document.createTextNode(`\n\n${text}\n\n`));
+                if (container) {
+                  observer.observe(container, {
+                    childList: true,
+                    subtree: true,
+                    characterData: true,
+                  });
                 }
-              });
 
-              const raw = clone.textContent ?? '';
-              return raw.replace(/\n{3,}/g, '\n\n').trim();
-            }
+                const pollInterval = window.setInterval(() => {
+                  if (isDone) return;
+                  emitDelta();
 
-            function getThoughtText(root: HTMLElement | undefined): string {
-              if (!root) return '';
-              const thinkEl = root.querySelector(thinkSelector) as HTMLElement | null;
-              if (!thinkEl) return '';
+                  const running = isModelRunning();
+                  const currentMain = getMainText(container);
+                  const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
 
-              const clone = thinkEl.cloneNode(true) as HTMLElement;
-              clone
-                .querySelectorAll(
-                  'button, mat-icon, .mat-mdc-button-touch-target, [hide-from-message-actions], .thought-title, mat-expansion-panel-header'
-                )
-                .forEach((el) => el.remove());
-
-              clone.querySelectorAll('h1, h2, h3, h4, p, span, div').forEach((el) => {
-                const t = el.textContent?.trim();
-                if (t === 'Thinking Process' || t === '思考過程' || t === 'Thinking' || t === 'Thoughts') {
-                  el.remove();
-                }
-              });
-
-              return domToMarkdown(clone);
-            }
-
-            function getMainText(root: HTMLElement | undefined): string {
-              if (!root) return '';
-              const clone = root.cloneNode(true) as HTMLElement;
-
-              clone
-                .querySelectorAll(
-                  `${thinkSelector}, .table-footer, gem-icon-button, gem-popover, button, .mat-mdc-button-touch-target, [hide-from-message-actions], mat-icon`
-                )
-                .forEach((el) => el.remove());
-
-              return domToMarkdown(clone);
-            }
-
-            function hasCompleteToolCall(raw: string): boolean {
-              const markerIdx = raw.indexOf('@use_mcp_tool');
-              if (markerIdx === -1) return false;
-
-              const braceStart = raw.indexOf('{', markerIdx);
-              if (braceStart === -1) return false;
-
-              let depth = 0;
-              let inString = false;
-              let escape = false;
-
-              for (let i = braceStart; i < raw.length; i++) {
-                const char = raw[i];
-                if (escape) {
-                  escape = false;
-                  continue;
-                }
-                if (char === '\\') {
-                  escape = true;
-                  continue;
-                }
-                if (char === '"') {
-                  inString = !inString;
-                  continue;
-                }
-                if (!inString) {
-                  if (char === '{') depth++;
-                  else if (char === '}') {
-                    depth--;
-                    if (depth === 0) return true;
+                  if (!running && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
+                    void finish('done', currentMain);
+                    return;
                   }
-                }
-              }
-              return false;
-            }
 
-            let lastThoughtLen = 0;
-            let lastMainLen = 0;
-            let lastChangeTime = Date.now();
-            let isDone = false;
+                  if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1500) {
+                    void finish('done', currentMain);
+                    return;
+                  }
 
-            function emitDelta() {
-              if (!container || isDone) return;
+                  if (hasGeneratedAny && Date.now() - lastChangeTime > 20000) {
+                    void finish('done', currentMain);
+                    return;
+                  }
 
-              const currentThought = getThoughtText(container);
-              if (currentThought.length > lastThoughtLen) {
-                const thoughtDelta = currentThought.slice(lastThoughtLen);
-                lastThoughtLen = currentThought.length;
-                lastChangeTime = Date.now();
-                customWindow.__pushChunk(
-                  JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
-                );
-              }
+                  if (Date.now() - lastChangeTime > 45000) {
+                    clickStopButton();
+                    void finish('timeout', '[Generation Timeout]: No response received within 45 seconds.');
+                    return;
+                  }
+                }, 200);
 
-              const currentMain = getMainText(container);
-              if (currentMain.length > lastMainLen) {
-                const mainDelta = currentMain.slice(lastMainLen);
-                lastMainLen = currentMain.length;
-                lastChangeTime = Date.now();
-                customWindow.__pushChunk(
-                  JSON.stringify({ type: 'content', delta: mainDelta })
-                );
-              }
-            }
-
-            function complete() {
-              if (isDone) return;
-              isDone = true;
-
-              emitDelta();
-              if (observer) observer.disconnect();
-              if (stopCheckInterval !== null) clearInterval(stopCheckInterval);
-
-              if (container) {
-                const finalThought = getThoughtText(container);
-                if (finalThought.length > lastThoughtLen) {
-                  const thoughtDelta = finalThought.slice(lastThoughtLen);
-                  lastThoughtLen = finalThought.length;
-                  customWindow.__pushChunk(
-                    JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
-                  );
-                }
-
-                const finalMain = getMainText(container);
-                if (finalMain.length > lastMainLen) {
-                  const mainDelta = finalMain.slice(lastMainLen);
-                  lastMainLen = finalMain.length;
-                  customWindow.__pushChunk(
-                    JSON.stringify({ type: 'content', delta: mainDelta })
-                  );
-                }
-              }
-
-              customWindow.__pushDone();
-              resolve(getMainText(container));
-            }
-
-            const observer = new MutationObserver(() => {
-              emitDelta();
-            });
-
-            if (container) {
-              observer.observe(container, {
-                childList: true,
-                subtree: true,
-                characterData: true,
+                emitDelta();
               });
+            },
+            {
+              turnSelector: this.selectors.RESPONSE_CONTAINER,
+              targetIndex: turnSnapshot,
+              stopSelector: this.selectors.STOP_BUTTON,
+              thinkSelector: this.selectors.THINK_CONTAINER,
+              isModelRunningCode: isModelRunning.toString(),
             }
+          );
 
-            const stopCheckInterval = window.setInterval(() => {
-              if (isDone) return;
-              emitDelta();
-
-              const stopBtn = document.querySelector(stopSelector);
-              const isGenerating = stopBtn && (stopBtn as HTMLElement).offsetParent !== null;
-
-              const currentMain = getMainText(container);
-              if (!isGenerating && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
-                complete();
-                return;
-              }
-
-              const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
-
-              if (!isGenerating && hasGeneratedAny && Date.now() - lastChangeTime > 1500) {
-                complete();
-                return;
-              }
-
-              if (hasGeneratedAny && Date.now() - lastChangeTime > 20000) {
-                complete();
-                return;
-              }
-            }, 250);
-
-            emitDelta();
+          const abortPromise = new Promise<ObserveResult>((resolve) => {
+            if (options?.abortSignal?.aborted) {
+              resolve({ status: 'timeout', text: '[Generation Aborted by Client]' });
+              return;
+            }
+            options?.abortSignal?.addEventListener(
+              'abort',
+              () => resolve({ status: 'timeout', text: '[Generation Aborted by Client]' }),
+              { once: true }
+            );
           });
-        },
-        {
-          selector: this.selectors.RESPONSE_CONTAINER,
-          index: targetIndex,
-          stopSelector: this.selectors.STOP_BUTTON,
-          thinkSelector: this.selectors.THINK_CONTAINER,
+
+          const evalResult = await Promise.race([evalPromise, abortPromise]);
+
+          if (options?.abortSignal?.aborted || evalResult.status === 'timeout') {
+            await this.stop(worker);
+          }
+
+          finalMainText = evalResult.text;
         }
-      );
-    } finally {
-      if (finalDomText.length > rawFullMainText.length) {
-        const gapRemainder = finalDomText.slice(rawFullMainText.length);
-        onRawChunk(gapRemainder, false);
-        rawFullMainText = finalDomText;
+      } finally {
+        if (finalMainText.length > rawFullMainText.length) {
+          const gapRemainder = finalMainText.slice(rawFullMainText.length);
+          onRawChunk(gapRemainder, false);
+          rawFullMainText = finalMainText;
+        }
+        emitter.off('chunk', chunkListener);
       }
-      emitter.off('chunk', chunkListener);
+
+      let currentPath = new URL(page.url()).pathname;
+      if (currentPath === '/app') {
+        await page
+          .waitForFunction(
+            () => {
+              const p = new URL(window.location.href).pathname;
+              return p.startsWith('/app/') && p.length > 5;
+            },
+            { timeout: 3500 }
+          )
+          .catch(() => {});
+        currentPath = new URL(page.url()).pathname;
+      }
+
+      const resolvedText = finalMainText.trim() ? finalMainText : rawFullMainText;
+      console.log(`[${this.name}] Worker #${id} generation completed. Actual URL path: ${currentPath} (Total chars: ${resolvedText.length})`);
+      return { rawText: resolvedText, currentPath };
+    } catch (err) {
+      this.dirtyPages.add(page);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[${this.name}] Worker #${id} unexpected error:`, errorMsg);
+      return {
+        rawText: `[Error]: ${errorMsg}`,
+        currentPath: new URL(page.url()).pathname,
+      };
     }
-
-    const currentUrlObj = new URL(page.url());
-    const currentPath = currentUrlObj.pathname;
-    const resolvedText = finalDomText.trim() ? finalDomText : rawFullMainText;
-
-    console.log(`[Gemini] Worker #${id} generation completed. Current URL path: ${currentPath}`);
-    return { rawText: resolvedText, currentPath };
   }
 }

@@ -35,6 +35,59 @@ export interface ExecuteChatOptions {
   onReasoningDelta?: (delta: string) => void;
 }
 
+/**
+ * 瀏覽器端共用：相容 Trusted Types CSP 的函式反序列化還原器
+ */
+function browserCompileFn(fnCode: string) {
+  const w = window;
+  const body = 'return (' + fnCode + ')';
+  if (w.trustedTypes) {
+    return new Function(w.trustedTypes.createPolicy('evalPolicy', {
+      createScript: (scriptString: string) => scriptString,
+    }).createScript(body) as unknown as string)();
+  }
+  return new Function(body)();
+}
+
+/**
+ * 瀏覽器端共用：檢查 @use_mcp_tool 後方的 JSON 物件括號是否已完整閉合
+ */
+function browserHasCompleteToolCall(raw: string): boolean {
+  const markerIdx = raw.indexOf('@use_mcp_tool');
+  if (markerIdx === -1) return false;
+
+  const braceStart = raw.indexOf('{', markerIdx);
+  if (braceStart === -1) return false;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = braceStart; i < raw.length; i++) {
+    const char = raw[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (char === '\\') {
+      escape = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (char === '{') depth++;
+      else if (char === '}') {
+        depth--;
+        if (depth === 0) return true;
+      }
+    }
+  }
+  return false;
+}
+
 export abstract class WebAiProvider {
   abstract readonly name: string;
   abstract readonly baseUrl: string;
@@ -63,8 +116,38 @@ export abstract class WebAiProvider {
   }
 
   /**
-   * 核心修復：使任意 Playwright 操作能立即響應 abortSignal 中斷，不再無腦等待其結束
+   * 將共用的 Trusted Types 函式還原器與 hasCompleteToolCall 掛載至頁面 window.__webAiHelpers
    */
+  protected async ensureBrowserHelpers(page: Page): Promise<void> {
+    await page.evaluate(
+      ({ compileCode, hasCompleteToolCallCode }) => {
+        const w = window as any;
+        if (w.__webAiHelpers) return;
+
+        const body = 'return (' + compileCode + ')';
+        const policy = w.trustedTypes
+          ? w.__evalPolicy ||
+          (w.__evalPolicy = w.trustedTypes.createPolicy('evalPolicy', {
+            createScript: (scriptString: string) => scriptString,
+          }))
+          : null;
+
+        const rehydrate = new Function(
+          policy ? (policy.createScript(body) as unknown as string) : body
+        )() as (code: string) => (...args: any[]) => any;
+
+        w.__webAiHelpers = {
+          rehydrate,
+          hasCompleteToolCall: rehydrate(hasCompleteToolCallCode),
+        };
+      },
+      {
+        compileCode: browserCompileFn.toString(),
+        hasCompleteToolCallCode: browserHasCompleteToolCall.toString(),
+      }
+    );
+  }
+
   protected async withAbortCheck<T>(
     promise: Promise<T>,
     signal?: AbortSignal,
@@ -300,8 +383,8 @@ export abstract class WebAiProvider {
           typeof parsed.tool_name === 'string'
             ? parsed.tool_name
             : typeof parsed.name === 'string'
-            ? parsed.name
-            : ''
+              ? parsed.name
+              : ''
         ).trim();
 
         if (!toolNameRaw) {
@@ -351,7 +434,6 @@ export abstract class WebAiProvider {
       throw new Error('Chat generation aborted before navigation');
     }
 
-    // 競爭保護：若在導覽中斷連線，立即丟出例外中止流程
     await this.withAbortCheck(
       this.navigateConversation(worker.page, isNewConversation, targetPath),
       abortSignal,
@@ -399,7 +481,7 @@ export abstract class WebAiProvider {
 
         tempFilePath = path.join(
           os.tmpdir(),
-          `${this.name}_context_${Date.now()}_${Math.random().toString(36).slice(2)}.txt`
+          'Instructions.txt'
         );
         await fs.writeFile(tempFilePath, fileContent, 'utf8');
 
@@ -408,7 +490,6 @@ export abstract class WebAiProvider {
           throw new Error('Chat generation aborted before file upload');
         }
 
-        // 競爭保護：若在上傳過程中斷連線，立即中止流程
         await this.withAbortCheck(
           this.uploadFile(worker.page, tempFilePath),
           abortSignal,
@@ -436,8 +517,7 @@ export abstract class WebAiProvider {
         }
 
         console.log(
-          `[${this.name}] Worker #${worker.id} sending message (${
-            isNewConversation && retryCount === 0 ? 'new session' : 'continuation'
+          `[${this.name}] Worker #${worker.id} sending message (${isNewConversation && retryCount === 0 ? 'new session' : 'continuation'
           }): "${promptToSend.substring(0, 50).replace(/\n/g, ' ')}..."`
         );
 
@@ -528,7 +608,7 @@ export abstract class WebAiProvider {
       }
     } finally {
       if (tempFilePath) {
-        await fs.unlink(tempFilePath).catch(() => {});
+        await fs.unlink(tempFilePath).catch(() => { });
       }
     }
   }

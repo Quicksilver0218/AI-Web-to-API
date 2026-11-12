@@ -30,15 +30,13 @@ interface ObserveResult {
 /**
  * 統一的運行狀態判斷函式（瀏覽器環境執行）
  */
-function isModelRunning(
-  loadingSelector = '.ds-loading, .ds-cursor, [class*="loading"], [class*="streaming"]'
-): boolean {
-  const loadingEl = document.querySelector(loadingSelector);
+function isModelRunning(): boolean {
+  const loadingEl = document.querySelector('.ds-loading, .ds-cursor, [class*="loading"], [class*="streaming"]');
   return loadingEl !== null && (loadingEl as HTMLElement).offsetParent !== null;
 }
 
 export class DeepSeekProvider extends WebAiProvider {
-  readonly name = 'deepseek';
+  readonly name = 'DeepSeek';
   readonly baseUrl = 'https://chat.deepseek.com';
 
   private readonly stoppingPromises = new WeakMap<Page, Promise<void>>();
@@ -64,6 +62,10 @@ export class DeepSeekProvider extends WebAiProvider {
     SCROLL_CONTAINER: '.ds-virtual-list.ds-scroll-area',
   } as const;
 
+  public async isModelRunning(page: Page): Promise<boolean> {
+    return await page.evaluate(isModelRunning).catch(() => false);
+  }
+
   public async stop(worker: PageWorker): Promise<void> {
     const existing = this.stoppingPromises.get(worker.page);
     if (existing) {
@@ -73,16 +75,15 @@ export class DeepSeekProvider extends WebAiProvider {
     const promise = (async () => {
       try {
         this.dirtyPages.add(worker.page);
-        console.log(`[DeepSeek] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
+        console.log(`[${this.name}] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
 
-        // 等待外部統一的 isModelRunning 成立（最多 5 秒）
         await worker.page.waitForFunction(isModelRunning, undefined, { timeout: 5000 });
 
-        console.log(`[DeepSeek] Worker #${worker.id} model confirmed running. Clicking SEND_OR_STOP_BUTTON...`);
+        console.log(`[${this.name}] Worker #${worker.id} model confirmed running. Clicking SEND_OR_STOP_BUTTON...`);
         const stopBtn = worker.page.locator(this.selectors.SEND_OR_STOP_BUTTON).first();
         await stopBtn.click({ timeout: 2000 });
       } catch (err) {
-        console.warn(`[DeepSeek] Worker #${worker.id} stop execution warning:`, err);
+        console.warn(`[${this.name}] Worker #${worker.id} stop execution warning:`, err);
       }
     })();
 
@@ -105,10 +106,10 @@ export class DeepSeekProvider extends WebAiProvider {
         const ariaPressed = await toggleLocator.getAttribute('aria-pressed');
         const isActive = ariaPressed === 'true';
 
-        console.log(`[DeepSeek] DeepThink Toggle: currently active=${isActive}, target enable=${enable}`);
+        console.log(`[${this.name}] DeepThink Toggle: currently active=${isActive}, target enable=${enable}`);
 
         if (enable && !isActive) {
-          console.log('[DeepSeek] -> Clicking to ENABLE DeepThink...');
+          console.log('[${this.name}] -> Clicking to ENABLE DeepThink...');
           await toggleLocator.scrollIntoViewIfNeeded().catch(() => {});
           await toggleLocator.click({ timeout: 2000 });
 
@@ -117,18 +118,18 @@ export class DeepSeekProvider extends WebAiProvider {
             await toggleLocator.click({ force: true, timeout: 2000 }).catch(() => {});
           }
         } else if (!enable && isActive) {
-          console.log('[DeepSeek] -> Clicking to DISABLE DeepThink...');
+          console.log('[${this.name}] -> Clicking to DISABLE DeepThink...');
           await toggleLocator.scrollIntoViewIfNeeded().catch(() => {});
           await toggleLocator.click({ timeout: 2000 });
         }
       }
     } catch (err) {
-      console.warn('[DeepSeek] setThinkingLevel warning:', err);
+      console.warn('[${this.name}] setThinkingLevel warning:', err);
     }
   }
 
   async uploadFile(page: Page, filePath: string): Promise<void> {
-    console.log(`[DeepSeek] Uploading attachment file: ${filePath}`);
+    console.log(`[${this.name}] Uploading attachment file: ${filePath}`);
 
     const fileInput = page.locator(this.selectors.FILE_INPUT).first();
 
@@ -142,7 +143,7 @@ export class DeepSeekProvider extends WebAiProvider {
       await fileChooser.setFiles(filePath);
     }
 
-    console.log('[DeepSeek] Attachment uploaded and parsed.');
+    console.log('[${this.name}] Attachment uploaded and parsed.');
   }
 
   async navigateConversation(page: Page, isNewConversation: boolean, targetPath?: string): Promise<void> {
@@ -158,7 +159,7 @@ export class DeepSeekProvider extends WebAiProvider {
       const isDirty = this.dirtyPages.has(page) || items > 0 || hasInputText || hasFiles > 0 || currentUrlObj.pathname !== '/';
 
       if (isDirty) {
-        console.log('[DeepSeek] Page is dirty or starting new session. Force reloading to baseUrl...');
+        console.log('[${this.name}] Page is dirty or starting new session. Force reloading to baseUrl...');
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
         this.dirtyPages.delete(page);
       }
@@ -169,13 +170,13 @@ export class DeepSeekProvider extends WebAiProvider {
       const currentUrlObj = new URL(page.url());
       if (currentUrlObj.pathname !== targetPath) {
         const targetFullUrl = `${this.baseUrl}${targetPath}`;
-        console.log(`[DeepSeek] Switching to target conversation: ${targetFullUrl}`);
+        console.log(`[${this.name}] Switching to target conversation: ${targetFullUrl}`);
         await page.goto(targetFullUrl, { waitUntil: 'domcontentloaded' });
       } else {
-        console.log(`[DeepSeek] Tab is already on target conversation (${targetPath}), continuing directly.`);
+        console.log(`[${this.name}] Tab is already on target conversation (${targetPath}), continuing directly.`);
       }
     } else {
-      console.log(`[DeepSeek] Continuing in current active conversation tab (path: ${new URL(page.url()).pathname}).`);
+      console.log(`[${this.name}] Continuing in current active conversation tab (path: ${new URL(page.url()).pathname}).`);
     }
   }
 
@@ -229,7 +230,7 @@ export class DeepSeekProvider extends WebAiProvider {
     await page.waitForTimeout(600);
     const remainingVal = await input.inputValue().catch(() => '');
     if (remainingVal.trim().length > 0) {
-      console.log('[DeepSeek] Prompt remaining in input box, executing forced submit...');
+      console.log('[${this.name}] Prompt remaining in input box, executing forced submit...');
       await sendBtn.click({ force: true, timeout: 2000 }).catch(() => {});
       await input.focus();
       await page.keyboard.press('Enter');
@@ -254,7 +255,7 @@ export class DeepSeekProvider extends WebAiProvider {
       await this.setThinkingLevel(page, options?.thinkingLevel);
 
       const turnSnapshot = await this.getTurnSnapshot(page);
-      console.log(`[DeepSeek] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
+      console.log(`[${this.name}] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
 
       await this.submitPrompt(page, prompt);
 
@@ -293,13 +294,13 @@ export class DeepSeekProvider extends WebAiProvider {
         ]);
       } catch {
         if (options?.abortSignal?.aborted) {
-          console.warn(`[DeepSeek] Worker #${id} aborted during initial turn wait. Triggering stop...`);
+          console.warn(`[${this.name}] Worker #${id} aborted during initial turn wait. Triggering stop...`);
           await this.stop(worker);
           return { rawText: '[Generation Aborted by Client]', currentPath: new URL(page.url()).pathname };
         }
       }
 
-      console.log(`[DeepSeek] Worker #${id} new model turn detected.`);
+      console.log(`[${this.name}] Worker #${id} new model turn detected.`);
 
       let rawFullMainText = '';
       const chunkListener = (rawPayload: string) => {
@@ -338,6 +339,8 @@ export class DeepSeekProvider extends WebAiProvider {
             break;
           }
 
+          await this.ensureBrowserHelpers(page);
+
           const evalPromise = page.evaluate(
             ({
               itemSelector,
@@ -353,17 +356,9 @@ export class DeepSeekProvider extends WebAiProvider {
             }: ObserveStreamParams) => {
               return new Promise<ObserveResult>((resolve) => {
                 const customWindow = window as unknown as WindowWithCustomEvents;
-
-                // 從傳入的程式碼字串還原出統一的 isModelRunning 函式
-                const scriptContent = 'return (' + isModelRunningCode + ')';
-                const fn = new Function(
-                  window.trustedTypes ?
-                      window.trustedTypes.createPolicy('evalPolicy', {
-                        createScript: (scriptString: string) => scriptString,
-                      }).createScript(scriptContent) as unknown as string
-                    : scriptContent
-                )();
-                const isModelRunning = (): boolean => fn();
+                const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
+                const checkRunning = rehydrate(isModelRunningCode);
+                const isModelRunning = (): boolean => checkRunning();
 
                 function scrollToBottom(): void {
                   const scroller = document.querySelector(scrollSelector);
@@ -411,42 +406,6 @@ export class DeepSeekProvider extends WebAiProvider {
                   if (btn && btn.offsetParent !== null && isModelRunning()) {
                     btn.click();
                     return true;
-                  }
-                  return false;
-                }
-
-                function hasCompleteToolCall(raw: string): boolean {
-                  const markerIdx = raw.indexOf('@use_mcp_tool');
-                  if (markerIdx === -1) return false;
-
-                  const braceStart = raw.indexOf('{', markerIdx);
-                  if (braceStart === -1) return false;
-
-                  let depth = 0;
-                  let inString = false;
-                  let escape = false;
-
-                  for (let i = braceStart; i < raw.length; i++) {
-                    const char = raw[i];
-                    if (escape) {
-                      escape = false;
-                      continue;
-                    }
-                    if (char === '\\') {
-                      escape = true;
-                      continue;
-                    }
-                    if (char === '"') {
-                      inString = !inString;
-                      continue;
-                    }
-                    if (!inString) {
-                      if (char === '{') depth++;
-                      else if (char === '}') {
-                        depth--;
-                        if (depth === 0) return true;
-                      }
-                    }
                   }
                   return false;
                 }
@@ -675,18 +634,18 @@ export class DeepSeekProvider extends WebAiProvider {
                     if (finalThought.length > lastThoughtLen) {
                       const thoughtDelta = finalThought.slice(lastThoughtLen);
                       lastThoughtLen = finalThought.length;
-                      customWindow.__pushChunk(JSON.stringify({ type: 'reasoning', delta: thoughtDelta }));
+                      await customWindow.__pushChunk(JSON.stringify({ type: 'reasoning', delta: thoughtDelta }));
                     }
 
                     const finalMain = getMainText(turn);
                     if (finalMain.length > lastMainLen) {
                       const mainDelta = finalMain.slice(lastMainLen);
                       lastMainLen = finalMain.length;
-                      customWindow.__pushChunk(JSON.stringify({ type: 'content', delta: mainDelta }));
+                      await customWindow.__pushChunk(JSON.stringify({ type: 'content', delta: mainDelta }));
                     }
                   }
 
-                  customWindow.__pushDone();
+                  await customWindow.__pushDone();
                   resolve({
                     status,
                     text,
@@ -721,31 +680,26 @@ export class DeepSeekProvider extends WebAiProvider {
                   const running = isModelRunning();
                   const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
 
-                  // 情況 1：已輸出完整 MCP 工具呼叫
                   if (!running && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
                     void finish('done', currentMain);
                     return;
                   }
 
-                  // 情況 2：出現「继续生成 / Continue」
                   if (!running && hasGeneratedAny && hasContinueButton()) {
                     void finish('continue', currentMain);
                     return;
                   }
 
-                  // 情況 3：最新回合出現操作工具列（複製/重試/朗讀）
                   if (hasGeneratedAny && hasActionBar(turn)) {
                     void finish('done', currentMain);
                     return;
                   }
 
-                  // 情況 4：兜底保險（停止運作且靜止超過 1 秒）
                   if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1000) {
                     void finish('done', currentMain);
                     return;
                   }
 
-                  // 情況 5：45 秒超時
                   if (Date.now() - lastChangeTime > 45000) {
                     clickStopButton();
                     void finish('timeout', '[Generation Timeout]: No response received within 45 seconds.');
@@ -791,7 +745,7 @@ export class DeepSeekProvider extends WebAiProvider {
           }
 
           if (evalResult.status === 'rate_limit') {
-            console.warn(`[DeepSeek] Worker #${id} Rate limit error occurred. Retry after 2 seconds (${attempt}/${maxRetries})...`);
+            console.warn(`[${this.name}] Worker #${id} 遇到頻率限制錯誤。等待 2 秒後點擊重試 (${attempt}/${maxRetries})...`);
             await page.waitForTimeout(2000);
             const retryBtn = page.locator(this.selectors.RATE_LIMIT_RETRY_BUTTON).last();
             if (await retryBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
@@ -802,7 +756,7 @@ export class DeepSeekProvider extends WebAiProvider {
           }
 
           if (evalResult.status === 'continue') {
-            console.warn(`[DeepSeek] Worker #${id} 'Continue' button appeared. Retry after 2 seconds (${attempt}/${maxRetries})...`);
+            console.warn(`[${this.name}] Worker #${id} 遇到「继续生成」。等待 2 秒後點擊繼續 (${attempt}/${maxRetries})...`);
             await page.waitForTimeout(2000);
 
             const continueBtn = page.locator(this.selectors.CONTINUE_BUTTON).last();
@@ -822,7 +776,7 @@ export class DeepSeekProvider extends WebAiProvider {
         }
 
         if (!finalMainText) {
-          finalMainText = `[DeepSeek Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
+          finalMainText = `[Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
         }
       } finally {
         if (finalMainText.length > rawFullMainText.length) {
@@ -843,14 +797,14 @@ export class DeepSeekProvider extends WebAiProvider {
       }
 
       const resolvedText = finalMainText.trim() ? finalMainText : rawFullMainText;
-      console.log(`[DeepSeek] Worker #${id} generation completed. Actual URL path: ${currentPath} (Total chars: ${resolvedText.length})`);
+      console.log(`[${this.name}] Worker #${id} generation completed. Actual URL path: ${currentPath} (Total chars: ${resolvedText.length})`);
       return { rawText: resolvedText, currentPath };
     } catch (err) {
       this.dirtyPages.add(page);
       const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[DeepSeek] Worker #${id} unexpected error:`, errorMsg);
+      console.error(`[${this.name}] Worker #${id} unexpected error:`, errorMsg);
       return {
-        rawText: `[DeepSeek Error]: ${errorMsg}`,
+        rawText: `[Error]: ${errorMsg}`,
         currentPath: new URL(page.url()).pathname,
       };
     }

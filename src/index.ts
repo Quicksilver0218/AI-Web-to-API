@@ -11,27 +11,23 @@ import { AiStudioProvider } from './ai-studio.provider.js';
 import { BROWSER_DATA_PATH } from './utils.js';
 
 export interface ProviderOption extends ProviderSelection {
-  id: string;
   runLoginFlow: (path: string, extensionPath?: string) => Promise<void>;
 }
 
 const AVAILABLE_PROVIDERS: ProviderOption[] = [
   {
-    id: 'deepseek',
-    label: 'DeepSeek Chat',
+    name: 'DeepSeek Chat',
     provider: new DeepSeekProvider(),
     runLoginFlow: runDeepseekLogin,
   },
   {
-    id: 'ai_studio',
-    label: 'Google AI Studio',
+    name: 'Google AI Studio',
     provider: new AiStudioProvider(),
     runLoginFlow: runAiStudioLogin,
     extensionPath: '../proton_vpn'
   },
   {
-    id: 'gemini',
-    label: 'Google Gemini',
+    name: 'Google Gemini',
     provider: new GeminiProvider(),
     runLoginFlow: runGeminiLogin,
   },
@@ -109,9 +105,9 @@ function promptProviderSelection(): Promise<ProviderOption> {
 
       AVAILABLE_PROVIDERS.forEach((item, idx) => {
         if (idx === selectedIndex) {
-          console.log(` \x1b[36m> [x] ${item.label} (${item.id})\x1b[0m`);
+          console.log(` \x1b[36m> [o] ${item.name}\x1b[0m`);
         } else {
-          console.log(`   [ ] ${item.label} (${item.id})`);
+          console.log(`   [ ] ${item.name}`);
         }
       });
 
@@ -146,7 +142,7 @@ function promptProviderSelection(): Promise<ProviderOption> {
 }
 
 async function promptStartOrLogin(selected: ProviderOption): Promise<void> {
-  const label = `${selected.label} (${selected.id})`;
+  const label = `${selected.name}`;
   const options = [
     { value: 'start', label: 'Start server now' },
     { value: 'login', label: `Log in to ${label}` },
@@ -219,7 +215,7 @@ async function main(): Promise<void> {
 
   const selected = await promptProviderSelection();
 
-  console.log(`[Startup] Selected Provider: ${selected.label} (${selected.id})`);
+  console.log(`[Startup] Selected Provider: ${selected.name}`);
   await promptStartOrLogin(selected);
 
   await startServer(selected, config);

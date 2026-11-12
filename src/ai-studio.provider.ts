@@ -80,6 +80,12 @@ export class AiStudioProvider extends WebAiProvider {
     SCROLL_CONTAINER: 'ms-autoscroll-container',
   } as const;
 
+  public async isModelRunning(page: Page): Promise<boolean> {
+    return await page
+      .evaluate(isModelRunning, this.selectors.SEND_OR_STOP_BUTTON)
+      .catch(() => false);
+  }
+
   public async stop(worker: PageWorker): Promise<void> {
     const existing = this.stoppingPromises.get(worker.page);
     if (existing) {
@@ -89,20 +95,19 @@ export class AiStudioProvider extends WebAiProvider {
     const promise = (async () => {
       try {
         this.dirtyPages.add(worker.page);
-        console.log(`[AI Studio] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
+        console.log(`[${this.name}] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
 
-        // 等待外部統一的 isAiStudioRunning 成立（最多 5 秒）
         await worker.page.waitForFunction(
           isModelRunning,
           this.selectors.SEND_OR_STOP_BUTTON,
           { timeout: 5000 }
         );
 
-        console.log(`[AI Studio] Worker #${worker.id} model confirmed running. Clicking SEND_OR_STOP_BUTTON...`);
+        console.log(`[${this.name}] Worker #${worker.id} model confirmed running. Clicking SEND_OR_STOP_BUTTON...`);
         const stopBtn = worker.page.locator(this.selectors.SEND_OR_STOP_BUTTON).first();
         await stopBtn.click({ timeout: 2000 });
       } catch (err) {
-        console.warn(`[AI Studio] Worker #${worker.id} stop execution warning:`, err);
+        console.warn(`[${this.name}] Worker #${worker.id} stop execution warning:`, err);
       }
     })();
 
@@ -143,8 +148,8 @@ export class AiStudioProvider extends WebAiProvider {
         return;
       }
 
-      console.log(`[AI Studio] Changing Thinking Level from "${currentVal}" to "${targetLevel}"...`);
-      await selectLocator.scrollIntoViewIfNeeded().catch(() => { });
+      console.log(`[${this.name}] Changing Thinking Level from "${currentVal}" to "${targetLevel}"...`);
+      await selectLocator.scrollIntoViewIfNeeded().catch(() => {});
       await selectLocator.click({ timeout: 2000 });
 
       const optionLocator = page
@@ -154,29 +159,32 @@ export class AiStudioProvider extends WebAiProvider {
 
       if (await optionLocator.isVisible({ timeout: 2500 }).catch(() => false)) {
         await optionLocator.click({ timeout: 2000 });
-        console.log(`[AI Studio] Successfully applied Thinking Level: "${targetLevel}"`);
+        console.log(`[${this.name}] Successfully applied Thinking Level: "${targetLevel}"`);
       } else {
-        await page.keyboard.press('Escape').catch(() => { });
+        await page.keyboard.press('Escape').catch(() => {});
       }
 
       await page.waitForSelector('.cdk-overlay-pane:has(mat-option)', { state: 'detached', timeout: 1500 }).catch(async () => {
-        await page.keyboard.press('Escape').catch(() => { });
+        await page.keyboard.press('Escape').catch(() => {});
       });
     } catch (err) {
-      console.warn('[AI Studio] setThinkingLevel error:', err);
-      await page.keyboard.press('Escape').catch(() => { });
+      console.warn('[${this.name}] setThinkingLevel error:', err);
+      await page.keyboard.press('Escape').catch(() => {});
     }
   }
 
   public async ensureRawModeEnabled(page: Page): Promise<void> {
     try {
-      const moreActionsBtn = page.locator(this.selectors.VIEW_MORE_ACTIONS_BUTTON)
+      const moreActionsLocator = page.locator(this.selectors.VIEW_MORE_ACTIONS_BUTTON);
+      if ((await moreActionsLocator.count()) === 0) return;
+
+      const moreActionsBtn = moreActionsLocator.last();
       await moreActionsBtn.waitFor({ state: 'visible', timeout: 2000 });
-      await moreActionsBtn.scrollIntoViewIfNeeded().catch(() => { });
+      await moreActionsBtn.scrollIntoViewIfNeeded().catch(() => {});
       await moreActionsBtn.click({ timeout: 2000 });
 
       const rawModeBtn = page.locator(this.selectors.RAW_MODE_BUTTON).first();
-      await rawModeBtn.waitFor({ state: 'visible', timeout: 2000 });
+      await rawModeBtn.waitFor({ state: 'visible', timeout: 2500 });
 
       const checkmarkInBtn = rawModeBtn.locator(this.selectors.RAW_MODE_CHECKMARK);
       const globalCheckmark = page.locator(this.selectors.RAW_MODE_CHECKMARK);
@@ -186,19 +194,19 @@ export class AiStudioProvider extends WebAiProvider {
         (await globalCheckmark.count()) > 0;
 
       if (!hasCheckmark) {
-        console.log('[AI Studio] Checkmark not found. Enabling Raw Mode...');
+        console.log('[${this.name}] Checkmark not found. Enabling Raw Mode...');
         await rawModeBtn.click({ timeout: 2000 });
       } else {
-        await page.keyboard.press('Escape').catch(() => { });
+        await page.keyboard.press('Escape').catch(() => {});
       }
     } catch (err) {
-      console.warn('[AI Studio] ensureRawModeEnabled notice:', err);
-      await page.keyboard.press('Escape').catch(() => { });
+      console.warn('[${this.name}] ensureRawModeEnabled notice:', err);
+      await page.keyboard.press('Escape').catch(() => {});
     }
   }
 
   async uploadFile(page: Page, filePath: string): Promise<void> {
-    console.log(`[AI Studio] Uploading attachment file: ${filePath}`);
+    console.log(`[${this.name}] Uploading attachment file: ${filePath}`);
     await dismissAiStudioDialogs(page);
 
     const directFileInput = page.locator(this.selectors.FILE_INPUT).first();
@@ -221,7 +229,7 @@ export class AiStudioProvider extends WebAiProvider {
       await fileChooser.setFiles(filePath);
     }
 
-    console.log('[AI Studio] Attachment uploaded and mounted.');
+    console.log('[${this.name}] Attachment uploaded and mounted.');
   }
 
   async navigateConversation(
@@ -240,14 +248,14 @@ export class AiStudioProvider extends WebAiProvider {
       const isDirty = this.dirtyPages.has(page) || existingTurns > 0 || hasInputText || hasUploadedFiles > 0;
 
       if (isDirty) {
-        console.log(`[AI Studio] Page is dirty or starting new session. Force reloading to baseUrl...`);
+        console.log(`[${this.name}] Page is dirty or starting new session. Force reloading to baseUrl...`);
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
         this.dirtyPages.delete(page);
       }
       await dismissAiStudioDialogs(page);
       await this.ensureRawModeEnabled(page);
     } else {
-      console.log(`[AI Studio] Continuing in existing conversation tab (no reload).`);
+      console.log(`[${this.name}] Continuing in existing conversation tab (no reload).`);
       await dismissAiStudioDialogs(page);
     }
   }
@@ -266,10 +274,10 @@ export class AiStudioProvider extends WebAiProvider {
       el.value = '';
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-    }).catch(() => { });
+    }).catch(() => {});
     await input.fill('');
-    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => { });
-    await page.keyboard.press('Backspace').catch(() => { });
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
+    await page.keyboard.press('Backspace').catch(() => {});
 
     await input.fill(prompt);
     await input.dispatchEvent('input');
@@ -298,8 +306,8 @@ export class AiStudioProvider extends WebAiProvider {
     await page.waitForTimeout(600);
     const remainingVal = await input.inputValue().catch(() => '');
     if (remainingVal.trim().length > 0) {
-      console.log('[AI Studio] Prompt remaining in input box, executing forced submit...');
-      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => { });
+      console.log('[${this.name}] Prompt remaining in input box, executing forced submit...');
+      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => {});
       await input.focus();
       await page.keyboard.press('Enter');
     }
@@ -315,7 +323,6 @@ export class AiStudioProvider extends WebAiProvider {
     const currentUrlObj = new URL(page.url());
     const currentPath = currentUrlObj.pathname;
 
-    // 持續監視對話框開關標記
     let isWatchingDialogs = true;
     let dialogWatcherPromise: Promise<void> | null = null;
 
@@ -329,11 +336,10 @@ export class AiStudioProvider extends WebAiProvider {
       await this.setThinkingLevel(page, options?.thinkingLevel);
 
       let turnSnapshot = await this.getTurnSnapshot(page);
-      console.log(`[AI Studio] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
+      console.log(`[${this.name}] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
 
       await this.submitPrompt(page, prompt);
 
-      // 發送後啟動背景非同步監視任務，持續清理可能阻擋回覆的彈窗
       dialogWatcherPromise = (async () => {
         while (isWatchingDialogs) {
           try {
@@ -359,11 +365,10 @@ export class AiStudioProvider extends WebAiProvider {
             scroller.scrollTop = scroller.scrollHeight;
           }
         }, this.selectors.SCROLL_CONTAINER)
-        .catch(() => { });
+        .catch(() => {});
 
       await page.waitForFunction(
         ({ turnSelector, prevSnapshot }: WaitForTurnParams) => {
-          // 在瀏覽器端同步快速點擊彈窗按鈕
           const dialogActionSelectors = [
             '#g1-welcome-dialog button',
             'ms-g1-welcome-dialog button',
@@ -388,7 +393,7 @@ export class AiStudioProvider extends WebAiProvider {
         { timeout: 30000 }
       );
 
-      console.log(`[AI Studio] Worker #${id} new model turn detected.`);
+      console.log(`[${this.name}] Worker #${id} new model turn detected.`);
 
       let rawFullMainText = '';
       const chunkListener = (rawPayload: string) => {
@@ -425,21 +430,15 @@ export class AiStudioProvider extends WebAiProvider {
             break;
           }
 
+          await this.ensureBrowserHelpers(page);
+
           const evalPromise = page.evaluate(
             ({ turnSelector, scrollSelector, stopSelector, isModelRunningCode, prevSnapshot }: ObserveStreamParams) => {
               return new Promise<ObserveResult>((resolve) => {
                 const customWindow = window as unknown as WindowWithCustomEvents;
-
-                // 從傳入的程式碼字串還原出統一的 isModelRunning 函式
-                const scriptContent = 'return (' + isModelRunningCode + ')';
-                const fn = new Function(
-                  window.trustedTypes ?
-                    window.trustedTypes.createPolicy('evalPolicy', {
-                      createScript: (scriptString: string) => scriptString
-                    }).createScript(scriptContent) as unknown as string :
-                    scriptContent
-                )();
-                const isModelRunning = (): boolean => fn(stopSelector);
+                const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
+                const checkRunning = rehydrate(isModelRunningCode);
+                const isModelRunning = (): boolean => checkRunning(stopSelector);
 
                 function dismissDialogsInDom(): void {
                   const inlineSelectors = [
@@ -508,42 +507,6 @@ export class AiStudioProvider extends WebAiProvider {
                   if (btn && btn.offsetParent !== null && isModelRunning()) {
                     btn.click();
                     return true;
-                  }
-                  return false;
-                }
-
-                function hasCompleteToolCall(raw: string): boolean {
-                  const markerIdx = raw.indexOf('@use_mcp_tool');
-                  if (markerIdx === -1) return false;
-
-                  const braceStart = raw.indexOf('{', markerIdx);
-                  if (braceStart === -1) return false;
-
-                  let depth = 0;
-                  let inString = false;
-                  let escape = false;
-
-                  for (let i = braceStart; i < raw.length; i++) {
-                    const char = raw[i];
-                    if (escape) {
-                      escape = false;
-                      continue;
-                    }
-                    if (char === '\\') {
-                      escape = true;
-                      continue;
-                    }
-                    if (char === '"') {
-                      inString = !inString;
-                      continue;
-                    }
-                    if (!inString) {
-                      if (char === '{') depth++;
-                      else if (char === '}') {
-                        depth--;
-                        if (depth === 0) return true;
-                      }
-                    }
                   }
                   return false;
                 }
@@ -697,7 +660,7 @@ export class AiStudioProvider extends WebAiProvider {
                     if (finalThought.length > lastThoughtLen) {
                       const thoughtDelta = finalThought.slice(lastThoughtLen);
                       lastThoughtLen = finalThought.length;
-                      customWindow.__pushChunk(
+                      await customWindow.__pushChunk(
                         JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
                       );
                     }
@@ -706,20 +669,19 @@ export class AiStudioProvider extends WebAiProvider {
                     if (finalMain.length > lastMainLen) {
                       const mainDelta = finalMain.slice(lastMainLen);
                       lastMainLen = finalMain.length;
-                      customWindow.__pushChunk(
+                      await customWindow.__pushChunk(
                         JSON.stringify({ type: 'content', delta: mainDelta })
                       );
                     }
                   }
 
-                  customWindow.__pushDone();
+                  await customWindow.__pushDone();
                   resolve({ status, text });
                 }
 
                 const intervalTimer = window.setInterval(async () => {
                   if (isDone) return;
 
-                  // 每次檢查時在 DOM 端即時點擊清理對話框
                   dismissDialogsInDom();
 
                   const turn = getLatestTurn();
@@ -743,19 +705,16 @@ export class AiStudioProvider extends WebAiProvider {
                   const currentMain = getMainText();
                   const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
 
-                  // 情況 1：已輸出完整 MCP 工具呼叫
                   if (!running && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
                     void finish('done', currentMain);
                     return;
                   }
 
-                  // 情況 2：兜底保險（停止運作且靜止超過 1 秒）
                   if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1000) {
                     void finish('done', currentMain);
                     return;
                   }
 
-                  // 情況 3：45 秒超時
                   if (Date.now() - lastChangeTime > 45000) {
                     clickStopButton();
                     void finish('timeout', '[Generation Timeout]: No response received within 45 seconds.');
@@ -797,7 +756,7 @@ export class AiStudioProvider extends WebAiProvider {
 
           if (evalResult.status === 'retryable_error') {
             console.warn(
-              `[AI Studio] Worker #${id} Retryable error occurred (${evalResult.text}). Retry after 2 seconds (${attempt}/${maxRetries})...`
+              `[${this.name}] Worker #${id} Retryable error occurred (${evalResult.text}). Retry after 2 seconds (${attempt}/${maxRetries})...`
             );
             await page.waitForTimeout(2000);
             await dismissAiStudioDialogs(page);
@@ -825,7 +784,7 @@ export class AiStudioProvider extends WebAiProvider {
         }
 
         if (!finalMainText) {
-          finalMainText = `[AI Studio Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
+          finalMainText = `[Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
         }
       } finally {
         if (finalMainText.length > rawFullMainText.length) {
@@ -839,18 +798,17 @@ export class AiStudioProvider extends WebAiProvider {
       await dismissAiStudioDialogs(page);
       const resolvedText = finalMainText.trim() ? finalMainText : rawFullMainText;
 
-      console.log(`[AI Studio] Worker #${id} generation completed. Total main chars: ${resolvedText.length}`);
+      console.log(`[${this.name}] Worker #${id} generation completed. Total main chars: ${resolvedText.length}`);
       return { rawText: resolvedText, currentPath };
     } catch (err) {
       this.dirtyPages.add(page);
       const errorMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[AI Studio] Worker #${id} unexpected error:`, errorMsg);
+      console.error(`[${this.name}] Worker #${id} unexpected error:`, errorMsg);
       return {
-        rawText: `[AI Studio Error]: ${errorMsg}`,
+        rawText: `[Error]: ${errorMsg}`,
         currentPath,
       };
     } finally {
-      // 確保退出時關閉背景監視任務
       isWatchingDialogs = false;
       if (dialogWatcherPromise) {
         await dialogWatcherPromise.catch(() => {});

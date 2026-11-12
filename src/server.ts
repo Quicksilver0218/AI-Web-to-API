@@ -12,7 +12,7 @@ import { PagePool } from './page-pool.js';
 import { BROWSER_DATA_PATH } from './utils.js';
 
 export interface ProviderSelection {
-  label: string;
+  name: string;
   provider: WebAiProvider;
   extensionPath?: string;
 }
@@ -140,7 +140,7 @@ export async function startServer(
 ): Promise<void> {
   const { provider, extensionPath } = selected;
 
-  console.log(`[Startup] Initializing dedicated tab pool for: ${selected.label}...`);
+  console.log(`[Startup] Initializing dedicated tab pool for: ${selected.name}...`);
 
   const pool = new PagePool({
     userDataDir: BROWSER_DATA_PATH,
@@ -150,7 +150,7 @@ export async function startServer(
   });
 
   await pool.init(extensionPath && path.join(import.meta.dirname, extensionPath));
-  console.log(`[Startup] ${selected.label} tab pool successfully initialized.`);
+  console.log(`[Startup] ${selected.name} tab pool successfully initialized.`);
 
   const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -491,6 +491,6 @@ export async function startServer(
 
   server.listen(config.port, () => {
     console.log(`[Ready] Single-provider bridge running at: http://localhost:${config.port}/v1/chat/completions`);
-    console.log(`[Ready] Active Provider: ${selected.label}`);
+    console.log(`[Ready] Active Provider: ${selected.name}`);
   });
 }
