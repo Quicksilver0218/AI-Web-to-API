@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import readline from 'readline';
 import path from 'path';
-import { runLoginFlow as runAiStudioLogin } from './ai-studio.login.js';
-import { runLoginFlow as runGeminiLogin } from './gemini.login.js';
-import { runLoginFlow as runDeepseekLogin } from './deepseek.login.js';
-import { DeepSeekProvider } from './deepseek.provider.js';
-import { GeminiProvider } from './gemini.provider.js';
-import { startServer, type ProviderSelection, type StartServerConfig } from './server.js';
-import { AiStudioProvider } from './ai-studio.provider.js';
-import { BROWSER_DATA_PATH } from './utils.js';
+import { runLoginFlow as runAiStudioLogin } from './login/ai-studio.login.js';
+import { runLoginFlow as runGeminiLogin } from './login/gemini.login.js';
+import { runLoginFlow as runDeepseekLogin } from './login/deepseek.login.js';
+import { DeepSeekProvider } from './providers/deepseek.provider.js';
+import { GeminiProvider } from './providers/gemini.provider.js';
+import { startServer } from './core/server.js';
+import type { ProviderSelection, StartServerConfig } from './core/server.js';
+import { AiStudioProvider } from './providers/ai-studio.provider.js';
+import { BROWSER_DATA_PATH } from './shared/utils.js';
 
 export interface ProviderOption extends ProviderSelection {
   runLoginFlow: (path: string, extensionPath?: string) => Promise<void>;
@@ -16,18 +17,15 @@ export interface ProviderOption extends ProviderSelection {
 
 const AVAILABLE_PROVIDERS: ProviderOption[] = [
   {
-    name: 'DeepSeek Chat',
     provider: new DeepSeekProvider(),
     runLoginFlow: runDeepseekLogin,
   },
   {
-    name: 'Google AI Studio',
     provider: new AiStudioProvider(),
     runLoginFlow: runAiStudioLogin,
     extensionPath: '../proton_vpn'
   },
   {
-    name: 'Google Gemini',
     provider: new GeminiProvider(),
     runLoginFlow: runGeminiLogin,
   },
@@ -105,9 +103,9 @@ function promptProviderSelection(): Promise<ProviderOption> {
 
       AVAILABLE_PROVIDERS.forEach((item, idx) => {
         if (idx === selectedIndex) {
-          console.log(` \x1b[36m> [o] ${item.name}\x1b[0m`);
+          console.log(` \x1b[36m> [o] ${item.provider.name}\x1b[0m`);
         } else {
-          console.log(`   [ ] ${item.name}`);
+          console.log(`   [ ] ${item.provider.name}`);
         }
       });
 
@@ -142,7 +140,7 @@ function promptProviderSelection(): Promise<ProviderOption> {
 }
 
 async function promptStartOrLogin(selected: ProviderOption): Promise<void> {
-  const label = `${selected.name}`;
+  const label = `${selected.provider.name}`;
   const options = [
     { value: 'start', label: 'Start server now' },
     { value: 'login', label: `Log in to ${label}` },
@@ -215,7 +213,7 @@ async function main(): Promise<void> {
 
   const selected = await promptProviderSelection();
 
-  console.log(`[Startup] Selected Provider: ${selected.name}`);
+  console.log(`[Startup] Selected Provider: ${selected.provider.name}`);
   await promptStartOrLogin(selected);
 
   await startServer(selected, config);

@@ -8,7 +8,8 @@ import type {
   PageWorker,
   ChatExecutionResult,
   OpenAiTool,
-} from './types.js';
+  WindowWithCustomEvents,
+} from '@/shared/types.js';
 
 export interface ParsedMcpMetadata {
   serverName: string;
@@ -49,16 +50,29 @@ export interface SendPromptOptions {
   abortSignal?: AbortSignal;
 }
 
+export interface ReactBlockExtractOptions {
+  isThought?: boolean;
+  markdownSelector?: string;
+  includeFirstChild?: boolean;
+  includeParent?: boolean;
+  maxDepth?: number;
+  boundarySelector?: string;
+  includeChildrenProp?: boolean;
+}
+
 /**
  * 瀏覽器端共用：相容 Trusted Types CSP 的函式反序列化還原器
  */
 function browserCompileFn(fnCode: string) {
-  const w = window;
+  const w = window as unknown as WindowWithCustomEvents;
   const body = 'return (' + fnCode + ')';
   if (w.trustedTypes) {
-    return new Function(w.trustedTypes.createPolicy('evalPolicy', {
-      createScript: (scriptString: string) => scriptString,
-    }).createScript(body) as unknown as string)();
+    if (!w.__evalPolicy) {
+      w.__evalPolicy = w.trustedTypes.createPolicy('evalPolicy', {
+        createScript: (scriptString: string) => scriptString,
+      });
+    }
+    return new Function(w.__evalPolicy.createScript(body) as unknown as string)();
   }
   return new Function(body)();
 }
@@ -100,6 +114,198 @@ function browserHasCompleteToolCall(raw: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * 瀏覽器端共用：從單一內容區塊的局部 React Fiber 提取原始 Markdown
+ */
+function browserExtractReactBlockMarkdown(
+  root: Element | null,
+  options?: ReactBlockExtractOptions
+): string | null {
+  if (!root) return null;
+
+  const opts = options || {};
+  const isThought = Boolean(opts.isThought);
+  const maxDepth = opts.maxDepth ?? 25;
+  const boundarySelector = opts.boundarySelector;
+  const includeChildrenProp = Boolean(opts.includeChildrenProp);
+
+  const targets: (Element | null)[] = [root];
+  if (opts.markdownSelector) {
+    targets.push(root.querySelector(opts.markdownSelector));
+  }
+  if (opts.includeFirstChild) {
+    targets.push(root.firstElementChild);
+  }
+  if (opts.includeParent) {
+    targets.push(root.parentElement);
+  }
+
+  for (const el of targets) {
+    if (!el) continue;
+    const fiberKey = Object.keys(el).find(
+      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
+    );
+    if (!fiberKey) continue;
+
+    let fiber = (el as unknown as Record<string, any>)[fiberKey];
+    let depth = 0;
+    while (fiber && depth < maxDepth) {
+      if (boundarySelector) {
+        const stateNode = fiber.stateNode;
+        if (
+          stateNode instanceof HTMLElement &&
+          stateNode !== el &&
+          stateNode.matches(boundarySelector)
+        ) {
+          break;
+        }
+      }
+
+      const props = fiber.memoizedProps;
+      if (props) {
+        if (isThought) {
+          if (typeof props.thinking_content === 'string' && props.thinking_content.trim().length > 0) {
+            return props.thinking_content;
+          }
+          if (typeof props.reasoning_content === 'string' && props.reasoning_content.trim().length > 0) {
+            return props.reasoning_content;
+          }
+          if (typeof props.content === 'string' && props.content.trim().length > 0) {
+            return props.content;
+          }
+          if (typeof props.markdown === 'string' && props.markdown.trim().length > 0) {
+            return props.markdown;
+          }
+          if (typeof props.rawContent === 'string' && props.rawContent.trim().length > 0) {
+            return props.rawContent;
+          }
+          if (typeof props.text === 'string' && props.text.trim().length > 0) {
+            return props.text;
+          }
+          if (includeChildrenProp && typeof props.children === 'string' && props.children.trim().length > 0) {
+            return props.children;
+          }
+        } else {
+          if (typeof props.content === 'string' && props.content.trim().length > 0) {
+            return props.content;
+          }
+          if (typeof props.markdown === 'string' && props.markdown.trim().length > 0) {
+            return props.markdown;
+          }
+          if (typeof props.text === 'string' && props.text.trim().length > 0) {
+            return props.text;
+          }
+          if (typeof props.rawContent === 'string' && props.rawContent.trim().length > 0) {
+            return props.rawContent;
+          }
+          if (includeChildrenProp && typeof props.children === 'string' && props.children.trim().length > 0) {
+            return props.children;
+          }
+          if (
+            props.message &&
+            typeof props.message.content === 'string' &&
+            props.message.content.trim().length > 0
+          ) {
+            return props.message.content;
+          }
+        }
+      }
+      fiber = fiber.return;
+      depth++;
+    }
+  }
+  return null;
+}
+
+/**
+ * 瀏覽器端共用：將聊天訊息 DOM 內容轉換為原始 Markdown（含 KaTeX 還原、標題/列表/段落/表格序列化）
+ */
+function browserDomToMarkdown(container: HTMLElement | null): string {
+  if (!container) return '';
+  const clone = container.cloneNode(true) as HTMLElement;
+
+  clone
+    .querySelectorAll('.ds-scroll-area__gutters, [class*="gutter"], button, .actions')
+    .forEach((el) => el.remove());
+
+  clone.querySelectorAll('.katex').forEach((katex) => {
+    const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
+    const rawTex = annotation?.textContent ?? '';
+    katex.replaceWith(document.createTextNode(`$${rawTex}$`));
+  });
+
+  clone
+    .querySelectorAll('h1')
+    .forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
+  clone
+    .querySelectorAll('h2')
+    .forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
+  clone
+    .querySelectorAll('h3')
+    .forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
+  clone
+    .querySelectorAll('h4, h5, h6')
+    .forEach((h) =>
+      h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`))
+    );
+
+  clone.querySelectorAll('li').forEach((li) => {
+    const text = li.textContent?.trim() ?? '';
+    li.replaceWith(document.createTextNode(`\n- ${text}\n`));
+  });
+
+  clone.querySelectorAll('p, .ds-markdown-paragraph').forEach((p) => {
+    const text = p.textContent?.trim() ?? '';
+    if (text) {
+      p.replaceWith(document.createTextNode(`\n\n${text}\n\n`));
+    }
+  });
+
+  clone.querySelectorAll('table').forEach((table) => {
+    const rows = Array.from(table.querySelectorAll('tr'));
+    if (rows.length === 0) return;
+
+    const mdRows: string[] = [];
+    let colCount = 0;
+    let delimiterSet = false;
+
+    for (let i = 0; i < rows.length; i++) {
+      const cells = Array.from(rows[i].querySelectorAll('th, td'));
+      if (cells.length === 0) continue;
+
+      const cellTexts = cells.map((c) => {
+        const cClone = c.cloneNode(true) as HTMLElement;
+        cClone
+          .querySelectorAll('code')
+          .forEach((cd) => cd.replaceWith(document.createTextNode(`\`${cd.textContent ?? ''}\``)));
+        cClone
+          .querySelectorAll('strong, b')
+          .forEach((b) => b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`)));
+        return (cClone.textContent ?? '').trim().replace(/\r?\n+/g, ' ').replace(/\|/g, '\\|');
+      });
+
+      if (i === 0) {
+        colCount = cellTexts.length;
+        mdRows.push(`| ${cellTexts.join(' | ')} |`);
+        if (!delimiterSet) {
+          mdRows.push(`| ${cellTexts.map(() => '---').join(' | ')} |`);
+          delimiterSet = true;
+        }
+      } else {
+        while (colCount > 0 && cellTexts.length < colCount) {
+          cellTexts.push('');
+        }
+        mdRows.push(`| ${cellTexts.join(' | ')} |`);
+      }
+    }
+
+    table.replaceWith(document.createTextNode(`\n\n${mdRows.join('\n')}\n\n`));
+  });
+
+  const raw = clone.textContent ?? '';
+  return raw.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 export abstract class WebAiProvider {
@@ -198,34 +404,43 @@ export abstract class WebAiProvider {
   }
 
   /**
-   * 將共用的 Trusted Types 函式還原器與 hasCompleteToolCall 掛載至頁面 window.__webAiHelpers
+   * 將共用的 Trusted Types 函式還原器、hasCompleteToolCall、React Fiber 提取器與 domToMarkdown 掛載至頁面 window.__webAiHelpers
    */
   protected async ensureBrowserHelpers(page: Page): Promise<void> {
     await page.evaluate(
-      ({ compileCode, hasCompleteToolCallCode }) => {
-        const w = window as any;
+      ({
+        compileCode,
+        hasCompleteToolCallCode,
+        extractReactBlockMarkdownCode,
+        domToMarkdownCode,
+      }) => {
+        const w = window as unknown as WindowWithCustomEvents;
         if (w.__webAiHelpers) return;
 
         const body = 'return (' + compileCode + ')';
         const policy = w.trustedTypes
           ? w.__evalPolicy ||
-          (w.__evalPolicy = w.trustedTypes.createPolicy('evalPolicy', {
-            createScript: (scriptString: string) => scriptString,
-          }))
+            (w.__evalPolicy = w.trustedTypes.createPolicy('evalPolicy', {
+              createScript: (scriptString: string) => scriptString,
+            }))
           : null;
 
         const rehydrate = new Function(
           policy ? (policy.createScript(body) as unknown as string) : body
-        )() as (code: string) => (...args: any[]) => any;
+        )() as <T>(code: string) => (...args: unknown[]) => T;
 
         w.__webAiHelpers = {
           rehydrate,
           hasCompleteToolCall: rehydrate(hasCompleteToolCallCode),
+          extractReactBlockMarkdown: rehydrate(extractReactBlockMarkdownCode),
+          domToMarkdown: rehydrate(domToMarkdownCode),
         };
       },
       {
         compileCode: browserCompileFn.toString(),
         hasCompleteToolCallCode: browserHasCompleteToolCall.toString(),
+        extractReactBlockMarkdownCode: browserExtractReactBlockMarkdown.toString(),
+        domToMarkdownCode: browserDomToMarkdown.toString(),
       }
     );
   }
@@ -585,7 +800,14 @@ export abstract class WebAiProvider {
           throw new Error('Chat generation aborted after file upload');
         }
 
-        promptToSend = `I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.\nPlease read the rules and tool definitions in the attachment carefully.\n[CRITICAL EXECUTION RULES]: When you need to call a tool, directly output @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}} in plain text. Paths MUST strictly use forward slashes (/), and NEVER wrap it inside markdown code blocks.\nPlease execute the following task:\n\n${userTask}`;
+        promptToSend = [
+          'I have uploaded the full system instructions and callable MCP Tools specifications into the attachment file above.',
+          'Please read the rules and tool definitions in the attachment carefully.',
+          '[CRITICAL EXECUTION RULES]: When you need to call a tool, directly output @use_mcp_tool{"server_name": "...", "tool_name": "...", "arguments": {...}} in plain text. Paths MUST strictly use forward slashes (/), and NEVER wrap it inside markdown code blocks.',
+          'My system is isolated from your environment, so you can only access my system using the tools I have provided.',
+          'Please execute the following task:',
+          `\n${userTask}`
+        ].join('\n');
       } else {
         promptToSend = this.formatContinuationPrompt(messages);
       }

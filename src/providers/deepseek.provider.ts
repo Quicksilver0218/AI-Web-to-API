@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
-import { WebAiProvider, type SendPromptOptions } from './web-ai-provider.js';
-import type { PageWorker, WindowWithCustomEvents } from './types.ts';
+import { WebAiProvider, type SendPromptOptions } from '@/core/web-ai-provider.js';
+import type { PageWorker, WindowWithCustomEvents } from '@/shared/types.js';
 
 interface WaitForTurnParams {
   turnSelector: string;
@@ -321,8 +321,8 @@ export class DeepSeekProvider extends WebAiProvider {
             }: ObserveStreamParams) => {
               return new Promise<ObserveResult>(async (resolve) => {
                 const customWindow = window as unknown as WindowWithCustomEvents;
-                const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
-                const checkRunning = rehydrate(isModelRunningCode);
+                const { rehydrate, hasCompleteToolCall, extractReactBlockMarkdown, domToMarkdown } = customWindow.__webAiHelpers!;
+                const checkRunning = rehydrate<boolean>(isModelRunningCode);
                 const isModelRunning = (): boolean => checkRunning();
 
                 function scrollToBottom(): void {
@@ -386,161 +386,20 @@ export class DeepSeekProvider extends WebAiProvider {
                   return actionEl !== null && actionEl.offsetParent !== null;
                 }
 
-                function getReactRawMarkdown(container: HTMLElement | null, isThought = false): string | null {
-                  if (!container) return null;
-
-                  const targets: (HTMLElement | null)[] = [
-                    container,
-                    container.querySelector('.ds-markdown'),
-                    container.parentElement,
-                  ];
-
-                  for (const el of targets) {
-                    if (!el) continue;
-                    const fiberKey = Object.keys(el).find(
-                      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
-                    );
-                    if (!fiberKey) continue;
-
-                    let fiber = (el as Record<string, any>)[fiberKey];
-                    let depth = 0;
-                    while (fiber && depth < 25) {
-                      const props = fiber.memoizedProps;
-                      if (props) {
-                        if (isThought) {
-                          if (typeof props.thinking_content === 'string' && props.thinking_content.trim().length > 0) {
-                            return props.thinking_content;
-                          }
-                          if (typeof props.reasoning_content === 'string' && props.reasoning_content.trim().length > 0) {
-                            return props.reasoning_content;
-                          }
-                          if (typeof props.content === 'string' && props.content.trim().length > 0) {
-                            return props.content;
-                          }
-                          if (typeof props.text === 'string' && props.text.trim().length > 0) {
-                            return props.text;
-                          }
-                        } else {
-                          if (typeof props.content === 'string' && props.content.trim().length > 0) {
-                            return props.content;
-                          }
-                          if (typeof props.text === 'string' && props.text.trim().length > 0) {
-                            return props.text;
-                          }
-                          if (typeof props.rawContent === 'string' && props.rawContent.trim().length > 0) {
-                            return props.rawContent;
-                          }
-                          if (
-                            props.message &&
-                            typeof props.message.content === 'string' &&
-                            props.message.content.trim().length > 0
-                          ) {
-                            return props.message.content;
-                          }
-                        }
-                      }
-                      fiber = fiber.return;
-                      depth++;
-                    }
-                  }
-                  return null;
-                }
-
-                function domToMarkdownFallback(container: HTMLElement | null): string {
-                  if (!container) return '';
-                  const clone = container.cloneNode(true) as HTMLElement;
-
-                  clone
-                    .querySelectorAll('.ds-scroll-area__gutters, [class*="gutter"], button, .actions')
-                    .forEach((el) => el.remove());
-
-                  clone.querySelectorAll('.katex').forEach((katex) => {
-                    const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
-                    const rawTex = annotation?.textContent ?? '';
-                    katex.replaceWith(document.createTextNode(`$${rawTex}$`));
-                  });
-
-                  clone
-                    .querySelectorAll('h1')
-                    .forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
-                  clone
-                    .querySelectorAll('h2')
-                    .forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
-                  clone
-                    .querySelectorAll('h3')
-                    .forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
-                  clone
-                    .querySelectorAll('h4, h5, h6')
-                    .forEach((h) =>
-                      h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`))
-                    );
-
-                  clone.querySelectorAll('li').forEach((li) => {
-                    const text = li.textContent?.trim() ?? '';
-                    li.replaceWith(document.createTextNode(`\n- ${text}\n`));
-                  });
-
-                  clone.querySelectorAll('p, .ds-markdown-paragraph').forEach((p) => {
-                    const text = p.textContent?.trim() ?? '';
-                    if (text) {
-                      p.replaceWith(document.createTextNode(`\n\n${text}\n\n`));
-                    }
-                  });
-
-                  clone.querySelectorAll('table').forEach((table) => {
-                    const rows = Array.from(table.querySelectorAll('tr'));
-                    if (rows.length === 0) return;
-
-                    const mdRows: string[] = [];
-                    let colCount = 0;
-                    let delimiterSet = false;
-
-                    for (let i = 0; i < rows.length; i++) {
-                      const cells = Array.from(rows[i].querySelectorAll('th, td'));
-                      if (cells.length === 0) continue;
-
-                      const cellTexts = cells.map((c) => {
-                        const cClone = c.cloneNode(true) as HTMLElement;
-                        cClone
-                          .querySelectorAll('code')
-                          .forEach((cd) => cd.replaceWith(document.createTextNode(`\`${cd.textContent ?? ''}\``)));
-                        cClone
-                          .querySelectorAll('strong, b')
-                          .forEach((b) => b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`)));
-                        return (cClone.textContent ?? '').trim().replace(/\r?\n+/g, ' ').replace(/\|/g, '\\|');
-                      });
-
-                      if (i === 0) {
-                        colCount = cellTexts.length;
-                        mdRows.push(`| ${cellTexts.join(' | ')} |`);
-                        if (!delimiterSet) {
-                          mdRows.push(`| ${cellTexts.map(() => '---').join(' | ')} |`);
-                          delimiterSet = true;
-                        }
-                      } else {
-                        while (colCount > 0 && cellTexts.length < colCount) {
-                          cellTexts.push('');
-                        }
-                        mdRows.push(`| ${cellTexts.join(' | ')} |`);
-                      }
-                    }
-
-                    table.replaceWith(document.createTextNode(`\n\n${mdRows.join('\n')}\n\n`));
-                  });
-
-                  const raw = clone.textContent ?? '';
-                  return raw.replace(/\n{3,}/g, '\n\n').trim();
-                }
-
                 function getThoughtText(turnRoot: HTMLElement | null): string {
                   if (!turnRoot) return '';
                   const thinkEl = turnRoot.querySelector(thinkSelector) as HTMLElement | null;
                   if (!thinkEl) return '';
 
-                  const rawReact = getReactRawMarkdown(thinkEl, true);
+                  const rawReact = extractReactBlockMarkdown(thinkEl, {
+                    isThought: true,
+                    markdownSelector: '.ds-markdown',
+                    includeParent: true,
+                    maxDepth: 10,
+                  });
                   if (rawReact) return rawReact;
 
-                  return domToMarkdownFallback(thinkEl);
+                  return domToMarkdown(thinkEl);
                 }
 
                 function getMainText(turnRoot: HTMLElement | null): string {
@@ -552,10 +411,15 @@ export class DeepSeekProvider extends WebAiProvider {
 
                   if (!mainEl) return '';
 
-                  const rawReact = getReactRawMarkdown(mainEl, false);
+                  const rawReact = extractReactBlockMarkdown(mainEl, {
+                    isThought: false,
+                    markdownSelector: '.ds-markdown',
+                    includeParent: true,
+                    maxDepth: 10,
+                  });
                   if (rawReact) return rawReact;
 
-                  return domToMarkdownFallback(mainEl);
+                  return domToMarkdown(mainEl);
                 }
 
                 let lastThoughtLen = initialThoughtLen;
@@ -634,7 +498,7 @@ export class DeepSeekProvider extends WebAiProvider {
                   await emitDelta();
 
                   const warningBtn = document.querySelector('.ds-button--warning');
-                  const hasErrorText = (document.body.innerText || '').includes('消息发送过于频繁');
+                  const hasErrorText = (document.body.textContent || '').includes('消息发送过于频繁');
                   if (warningBtn || hasErrorText) {
                     void finish('rate_limit', '');
                     return;

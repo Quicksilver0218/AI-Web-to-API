@@ -69,7 +69,10 @@ export interface ToolCallDelta {
 export interface ChatCompletionChunkChoice {
   index: number;
   delta: {
+    role?: RoleType;
     content?: string;
+    reasoning_content?: string;
+    reasoning?: string;
     tool_calls?: ToolCallDelta[];
   };
   finish_reason: 'stop' | 'tool_calls' | null;
@@ -110,7 +113,44 @@ export interface ChatCompletionResponse {
   choices: ChatCompletionResponseChoice[];
 }
 
+export interface ReactBlockExtractOptions {
+  isThought?: boolean;
+  markdownSelector?: string;
+  includeFirstChild?: boolean;
+  includeParent?: boolean;
+  maxDepth?: number;
+  boundarySelector?: string;
+  includeChildrenProp?: boolean;
+}
+
+export interface TrustedTypePolicy {
+  createScript(input: string, ...args: unknown[]): unknown;
+}
+
+export interface TrustedTypePolicyFactory {
+  createPolicy(
+    policyName: string,
+    policyOptions: {
+      createScript?: (input: string, ...args: unknown[]) => string;
+    }
+  ): TrustedTypePolicy;
+}
+
+export interface WebAiBrowserHelpers {
+  rehydrate: <T>(
+    fnCode: string
+  ) => (...args: unknown[]) => T;
+  hasCompleteToolCall: (raw: string) => boolean;
+  extractReactBlockMarkdown: (
+    root: Element | null,
+    options?: ReactBlockExtractOptions
+  ) => string | null;
+  domToMarkdown: (container: HTMLElement | null) => string;
+}
+
 export interface WindowWithCustomEvents extends Window {
   __pushChunk: (delta: string) => Promise<void>;
   __pushDone: () => Promise<void>;
+  __webAiHelpers?: WebAiBrowserHelpers;
+  __evalPolicy?: TrustedTypePolicy;
 }

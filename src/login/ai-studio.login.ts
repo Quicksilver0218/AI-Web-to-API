@@ -1,15 +1,12 @@
 import { chromium } from 'playwright';
 import readline from 'readline';
-import { waitForVpnConnection } from './utils.js';
-
-const AISTUDIO_URL = 'https://aistudio.google.com/prompts/new_chat';
+import { BROWSER_OPTIONS, waitForVpnConnection } from '@/shared/utils.js';
 
 export async function runLoginFlow(profilePath: string, extensionPath?: string): Promise<void> {
   console.log('[AI Studio Login] Launching Chromium window with persistent profile...');
   const context = await chromium.launchPersistentContext(profilePath, {
+    ...BROWSER_OPTIONS,
     headless: false,
-    channel: 'chromium',
-    viewport: { width: 1280, height: 800 },
     args: [
       '--disable-blink-features=AutomationControlled',
       ...extensionPath ? [
@@ -24,7 +21,7 @@ export async function runLoginFlow(profilePath: string, extensionPath?: string):
 
   await waitForVpnConnection(page, 0);
 
-  await page.goto(AISTUDIO_URL, { waitUntil: 'domcontentloaded' });
+  await page.goto('https://aistudio.google.com/prompts/new_chat', { waitUntil: 'domcontentloaded' });
 
   console.log('\n======================================================');
   console.log('1. Please sign in with your Google Account in the opened browser.');

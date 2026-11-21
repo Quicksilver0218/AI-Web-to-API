@@ -1,7 +1,7 @@
 import { chromium, type BrowserContext } from 'playwright';
 import { EventEmitter } from 'events';
-import { type PageWorker } from './types.js';
-import { waitForVpnConnection } from './utils.js';
+import type { PageWorker } from '@/shared/types.js';
+import { BROWSER_OPTIONS, waitForVpnConnection } from '@/shared/utils.js';
 
 export interface PagePoolOptions {
   userDataDir: string;
@@ -23,11 +23,9 @@ export class PagePool {
   async init(extensionPath?: string): Promise<void> {
     console.log('Launching Chromium sandbox environment...');
     this.context = await chromium.launchPersistentContext(this.options.userDataDir, {
+      ...BROWSER_OPTIONS,
       headless: this.options.headless,
-      channel: 'chromium',
-      viewport: { width: 1280, height: 800 },
       permissions: ['clipboard-read', 'clipboard-write'],
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
       args: [
         '--disable-blink-features=AutomationControlled',
         '--disable-gpu',

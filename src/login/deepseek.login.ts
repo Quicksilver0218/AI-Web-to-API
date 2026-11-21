@@ -1,25 +1,25 @@
+import { BROWSER_OPTIONS } from '@/shared/utils.js';
 import { chromium } from 'playwright';
 import readline from 'readline';
 
 export async function runLoginFlow(profilePath: string): Promise<void> {
-  console.log('[Gemini Login] Launching Chromium window with persistent profile...');
+  console.log('[DeepSeek Login] Launching Chromium window with persistent profile...');
 
   const context = await chromium.launchPersistentContext(profilePath, {
+    ...BROWSER_OPTIONS,
     headless: false,
-    channel: 'chromium',
-    viewport: { width: 1280, height: 800 },
     args: ['--disable-blink-features=AutomationControlled'],
   });
 
-  const page = context.pages()[0] || (await context.newPage());
+  const existingPages = context.pages();
+  const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
 
-  // 直接前往 Google 帳號登入入口，登入後自動導回 Gemini
-  await page.goto('https://accounts.google.com/ServiceLogin?continue=https://gemini.google.com/app');
+  await page.goto('https://chat.deepseek.com', { waitUntil: 'domcontentloaded' });
 
   console.log('\n======================================================');
   console.log('1. Please complete the login process in the opened browser window.');
   console.log('2. Pass any Cloudflare Turnstile or CAPTCHA verification if prompted.');
-  console.log('3. Verify that you have reached the main Gemini chat interface.');
+  console.log('3. Verify that you have reached the main DeepSeek chat interface.');
   console.log('4. Return to this terminal and press Enter to save the session and exit.');
   console.log('======================================================\n');
 
@@ -28,5 +28,5 @@ export async function runLoginFlow(profilePath: string): Promise<void> {
   rl.close();
 
   await context.close();
-  console.log(`[Gemini Login] Session successfully saved to: ${profilePath}`);
+  console.log(`[DeepSeek Login] Session successfully saved to: ${profilePath}`);
 }

@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
-import { WebAiProvider, type SendPromptOptions } from './web-ai-provider.js';
-import type { PageWorker, WindowWithCustomEvents } from './types.js';
+import { WebAiProvider, type SendPromptOptions } from '@/core/web-ai-provider.js';
+import type { PageWorker, WindowWithCustomEvents } from '@/shared/types.js';
 
 interface WaitForTurnParams {
   turnSelector: string;
@@ -22,7 +22,6 @@ interface ObserveResult {
   status: 'done' | 'retryable_error' | 'fatal_error' | 'upgrade_required' | 'timeout';
   text: string;
 }
-
 
 /**
  * 統一的運行狀態判斷函式（瀏覽器環境執行）
@@ -82,6 +81,10 @@ export class AiStudioProvider extends WebAiProvider {
     MODEL_SELECTOR_BUTTON: 'button.model-selector-card.ng-star-inserted',
     MODEL_SELECTOR_NAME: '[data-test-id=model-name]',
     MODEL_PANEL_CLOSE_BUTTON: 'button[aria-label="Close panel"]',
+    ADVANCED_SETTINGS_HEADER:
+      '.settings-item.settings-group-header:has(button[aria-label="Expand or collapse advanced settings"])',
+    ADVANCED_SETTINGS_EXPAND_BUTTON:
+      'button[aria-label="Expand or collapse advanced settings"]',
     OUTPUT_LENGTH_INPUT: 'input[name=maxOutputTokens], input[aria-describedby=output-length-hint]',
     SCROLL_CONTAINER: 'ms-autoscroll-container',
     UPGRADE_DIALOG:
@@ -206,9 +209,7 @@ export class AiStudioProvider extends WebAiProvider {
       if (!(await selectLocator.isVisible({ timeout: 5000 }).catch(() => false)))
         return;
 
-      const currentVal = (
-        await selectLocator.locator(this.selectors.THINKING_SELECT_VALUE).textContent() ?? ''
-      ).trim();
+      const currentVal = (await selectLocator.locator(this.selectors.THINKING_SELECT_VALUE).textContent())?.trim() ?? '';
 
       if (currentVal.toLowerCase() === targetLevel)
         return;
@@ -242,13 +243,39 @@ export class AiStudioProvider extends WebAiProvider {
     const targetOutputLength = '1048576';
     try {
       const outputLengthInput = page.locator(this.selectors.OUTPUT_LENGTH_INPUT).first();
-      const isOutputLengthVisible = await outputLengthInput
-        .waitFor({ state: 'visible', timeout: 5000 })
-        .then(() => true)
-        .catch(() => false);
+      let isOutputLengthVisible = await outputLengthInput.isVisible().catch(() => false);
 
       if (!isOutputLengthVisible) {
-        console.warn('[' + this.name + '] Output Length input not found or not visible.');
+        const header = page.locator(this.selectors.ADVANCED_SETTINGS_HEADER).first();
+        const isHeaderVisible = await header
+          .waitFor({ state: 'visible', timeout: 5000 })
+          .then(() => true)
+          .catch(() => false);
+
+        if (!isHeaderVisible) {
+          console.warn(`[${this.name}] Advanced settings header not found or not visible.`);
+          return;
+        }
+
+        const isExpanded = await header
+          .evaluate((el) => el.classList.contains('expanded'))
+          .catch(() => false);
+
+        if (!isExpanded) {
+          console.log(`[${this.name}] Expanding Advanced settings...`);
+          const expandBtn = header.locator(this.selectors.ADVANCED_SETTINGS_EXPAND_BUTTON).first();
+          await expandBtn.scrollIntoViewIfNeeded().catch(() => { });
+          await expandBtn.click({ timeout: 5000 });
+        }
+
+        isOutputLengthVisible = await outputLengthInput
+          .waitFor({ state: 'visible', timeout: 5000 })
+          .then(() => true)
+          .catch(() => false);
+      }
+
+      if (!isOutputLengthVisible) {
+        console.warn(`[${this.name}] Output Length input not found or not visible.`);
         return;
       }
 
@@ -257,7 +284,7 @@ export class AiStudioProvider extends WebAiProvider {
         return;
       }
 
-      console.log('[' + this.name + '] Changing Output Length from ' + currentVal + ' to ' + targetOutputLength + '...');
+      console.log(`[${this.name}] Changing Output Length from ${currentVal} to ${targetOutputLength}...`);
       await outputLengthInput.scrollIntoViewIfNeeded().catch(() => { });
       await outputLengthInput.click({ timeout: 5000 });
       await outputLengthInput.fill('');
@@ -265,9 +292,9 @@ export class AiStudioProvider extends WebAiProvider {
       await outputLengthInput.dispatchEvent('input');
       await outputLengthInput.dispatchEvent('change');
       await outputLengthInput.blur().catch(() => { });
-      console.log('[' + this.name + '] Successfully applied Output Length: ' + targetOutputLength);
+      console.log(`[${this.name}] Successfully applied Output Length: ${targetOutputLength}`);
     } catch (err) {
-      console.warn('[' + this.name + '] ensureOutputLength notice:', err);
+      console.warn(`[${this.name}] ensureOutputLength notice:`, err);
     }
   }
 
@@ -362,7 +389,7 @@ export class AiStudioProvider extends WebAiProvider {
 
   private async submitPrompt(page: Page, prompt: string): Promise<void> {
     const input = page.locator(this.selectors.PROMPT_INPUT).first();
-    await input.waitFor({ state: 'visible', timeout: 20000 });
+    await input.waitFor({ state: 'visible', timeout: 15000 });
 
     await input.click();
 
@@ -572,8 +599,8 @@ export class AiStudioProvider extends WebAiProvider {
             }: ObserveStreamParams) => {
               return new Promise<ObserveResult>(async (resolve) => {
                 const customWindow = window as unknown as WindowWithCustomEvents;
-                const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
-                const checkRunning = rehydrate(isModelRunningCode);
+                const { rehydrate, hasCompleteToolCall } = customWindow.__webAiHelpers!;
+                const checkRunning = rehydrate<boolean>(isModelRunningCode);
                 const isModelRunning = (): boolean => checkRunning(stopSelector);
 
                 function dismissDialogsInDom(): void {

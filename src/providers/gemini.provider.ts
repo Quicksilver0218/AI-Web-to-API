@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
-import { WebAiProvider, type SendPromptOptions } from './web-ai-provider.js';
-import type { PageWorker, WindowWithCustomEvents } from './types.ts';
+import { WebAiProvider, type SendPromptOptions } from '@/core/web-ai-provider.js';
+import type { PageWorker, WindowWithCustomEvents } from '@/shared/types.js';
 
 interface WaitForTurnParams {
   turnSelector: string;
@@ -29,7 +29,7 @@ function isModelRunning(stopSelector: string): boolean {
 }
 
 export class GeminiProvider extends WebAiProvider {
-  readonly name = 'Gemini';
+  readonly name = 'Google Gemini';
   readonly baseUrl = 'https://gemini.google.com/app';
 
   private readonly selectors = {
@@ -150,7 +150,7 @@ export class GeminiProvider extends WebAiProvider {
 
       const secondaryTextEl = pickerBtn.locator(this.selectors.PICKER_SECONDARY_TEXT).first();
       if (await secondaryTextEl.isVisible({ timeout: 5000 }).catch(() => false)) {
-        const currentText = (await secondaryTextEl.innerText().catch(() => '')).trim();
+        const currentText = (await secondaryTextEl.textContent().catch(() => ''))?.trim() ?? '';
         if (target.regex.test(currentText)) {
           console.log(`[${this.name}] Thinking Level already set to "${currentText}". Skipping menu open.`);
           return;
@@ -179,7 +179,7 @@ export class GeminiProvider extends WebAiProvider {
 
       for (let i = 0; i < count; i++) {
         const item = submenuItems.nth(i);
-        const labelText = (await item.locator('.label').innerText().catch(() => '')).trim();
+        const labelText = (await item.locator('.label').textContent().catch(() => ''))?.trim() ?? '';
         if (target.regex.test(labelText)) {
           targetOptionLocator = item;
           break;
@@ -296,6 +296,7 @@ export class GeminiProvider extends WebAiProvider {
     await input.waitFor({ state: 'visible', timeout: 15000 });
 
     await input.click();
+
     await input.evaluate((el: HTMLElement) => {
       el.textContent = '';
       el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -325,7 +326,7 @@ export class GeminiProvider extends WebAiProvider {
     }
 
     await page.waitForTimeout(600);
-    const remainingText = await input.innerText().catch(() => '');
+    const remainingText = await input.textContent().catch(() => '') ?? '';
     if (remainingText.trim().length > 0) {
       console.log(`[${this.name}] Prompt remaining in editor, executing forced submit...`);
       await sendBtn.click({ force: true, timeout: 5000 }).catch(() => { });
@@ -418,8 +419,8 @@ export class GeminiProvider extends WebAiProvider {
               return new Promise<ObserveResult>(async (resolve) => {
                 const container = document.querySelectorAll(turnSelector)[targetIndex] as HTMLElement | undefined;
                 const customWindow = window as unknown as WindowWithCustomEvents;
-                const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
-                const checkRunning = rehydrate(isModelRunningCode);
+                const { rehydrate, hasCompleteToolCall, domToMarkdown } = customWindow.__webAiHelpers!;
+                const checkRunning = rehydrate<boolean>(isModelRunningCode);
                 const isModelRunning = (): boolean => checkRunning(stopSelector);
 
                 function clickStopButton(): boolean {
@@ -429,116 +430,6 @@ export class GeminiProvider extends WebAiProvider {
                     return true;
                   }
                   return false;
-                }
-
-                function serializeCellContent(cell: Element): string {
-                  const cellClone = cell.cloneNode(true) as HTMLElement;
-
-                  cellClone.querySelectorAll('code').forEach((code) => {
-                    code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
-                  });
-
-                  cellClone.querySelectorAll('strong, b').forEach((b) => {
-                    b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
-                  });
-
-                  cellClone.querySelectorAll('em, i').forEach((em) => {
-                    em.replaceWith(document.createTextNode(`*${em.textContent ?? ''}*`));
-                  });
-
-                  const raw = cellClone.textContent ?? '';
-                  return raw.trim().replace(/\r?\n+/g, ' ').replace(/\|/g, '\\|');
-                }
-
-                function convertTableToMarkdown(table: HTMLTableElement): string {
-                  const rows = Array.from(table.querySelectorAll('tr'));
-                  if (rows.length === 0) return '';
-
-                  const mdRows: string[] = [];
-                  let colCount = 0;
-                  let delimiterSet = false;
-                  const thead = table.querySelector('thead');
-
-                  for (let i = 0; i < rows.length; i++) {
-                    const row = rows[i];
-                    const cells = Array.from(row.querySelectorAll('th, td'));
-                    if (cells.length === 0) continue;
-
-                    const cellTexts = cells.map(serializeCellContent);
-                    const isHeader = thead ? thead.contains(row) : i === 0;
-
-                    if (isHeader) {
-                      colCount = cellTexts.length;
-                      mdRows.push(`| ${cellTexts.join(' | ')} |`);
-                      if (!delimiterSet) {
-                        mdRows.push(`| ${cellTexts.map(() => '---').join(' | ')} |`);
-                        delimiterSet = true;
-                      }
-                    } else {
-                      while (colCount > 0 && cellTexts.length < colCount) {
-                        cellTexts.push('');
-                      }
-                      mdRows.push(`| ${cellTexts.join(' | ')} |`);
-                    }
-                  }
-
-                  return `\n\n${mdRows.join('\n')}\n\n`;
-                }
-
-                function domToMarkdown(root: HTMLElement): string {
-                  const clone = root.cloneNode(true) as HTMLElement;
-
-                  clone.querySelectorAll('.katex').forEach((katex) => {
-                    const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
-                    const rawTex = annotation?.textContent ?? '';
-                    katex.replaceWith(document.createTextNode(`$${rawTex}$`));
-                  });
-
-                  clone.querySelectorAll('table').forEach((table) => {
-                    const mdTable = convertTableToMarkdown(table as HTMLTableElement);
-                    const wrapper =
-                      table.closest('.horizontal-scroll-wrapper') ||
-                      table.closest('table-block') ||
-                      table;
-                    wrapper.replaceWith(document.createTextNode(mdTable));
-                  });
-
-                  clone.querySelectorAll('pre').forEach((pre) => {
-                    const code = pre.querySelector('code');
-                    const content = (code ?? pre).textContent ?? '';
-                    pre.replaceWith(document.createTextNode(`\n\`\`\`\n${content}\n\`\`\`\n`));
-                  });
-
-                  clone.querySelectorAll('code').forEach((code) => {
-                    code.replaceWith(document.createTextNode(`\`${code.textContent ?? ''}\``));
-                  });
-
-                  clone.querySelectorAll('b, strong').forEach((b) => {
-                    b.replaceWith(document.createTextNode(`**${b.textContent ?? ''}**`));
-                  });
-
-                  clone.querySelectorAll('h1').forEach((h) => h.replaceWith(document.createTextNode(`\n\n# ${h.textContent?.trim() ?? ''}\n\n`)));
-                  clone.querySelectorAll('h2').forEach((h) => h.replaceWith(document.createTextNode(`\n\n## ${h.textContent?.trim() ?? ''}\n\n`)));
-                  clone.querySelectorAll('h3').forEach((h) => h.replaceWith(document.createTextNode(`\n\n### ${h.textContent?.trim() ?? ''}\n\n`)));
-                  clone.querySelectorAll('h4, h5, h6').forEach((h) => h.replaceWith(document.createTextNode(`\n\n#### ${h.textContent?.trim() ?? ''}\n\n`)));
-
-                  clone.querySelectorAll('li').forEach((li) => {
-                    li.querySelectorAll('p').forEach((p) => {
-                      p.replaceWith(document.createTextNode(p.textContent?.trim() ?? ''));
-                    });
-                    const text = li.textContent?.trim() ?? '';
-                    li.replaceWith(document.createTextNode(`\n- ${text}\n`));
-                  });
-
-                  clone.querySelectorAll('p').forEach((p) => {
-                    const text = p.textContent?.trim() ?? '';
-                    if (text) {
-                      p.replaceWith(document.createTextNode(`\n\n${text}\n\n`));
-                    }
-                  });
-
-                  const raw = clone.textContent ?? '';
-                  return raw.replace(/\n{3,}/g, '\n\n').trim();
                 }
 
                 function getThoughtText(root: HTMLElement | undefined): string {
@@ -609,7 +500,6 @@ export class GeminiProvider extends WebAiProvider {
                   if (isDone) return;
                   isDone = true;
 
-                  await emitDelta();
                   if (observer) observer.disconnect();
                   if (pollInterval !== null) clearInterval(pollInterval);
 
@@ -662,12 +552,7 @@ export class GeminiProvider extends WebAiProvider {
                     return;
                   }
 
-                  if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1500) {
-                    void finish('done', currentMain);
-                    return;
-                  }
-
-                  if (hasGeneratedAny && Date.now() - lastChangeTime > 20000) {
+                  if (!running && hasGeneratedAny && Date.now() - lastChangeTime > 1000) {
                     void finish('done', currentMain);
                     return;
                   }
