@@ -1,24 +1,28 @@
 import type { Page } from 'playwright';
-import { WebAiProvider } from './web-ai-provider.js';
+import { WebAiProvider, type SendPromptOptions } from './web-ai-provider.js';
 import type { PageWorker, WindowWithCustomEvents } from './types.js';
 
 interface WaitForTurnParams {
   turnSelector: string;
   prevSnapshot: number;
+  upgradeDialogSelector: string;
 }
 
 interface ObserveStreamParams {
   turnSelector: string;
   scrollSelector: string;
   stopSelector: string;
+  upgradeDialogSelector: string;
+  upgradeErrorMessage: string;
   isModelRunningCode: string;
   prevSnapshot: number;
 }
 
 interface ObserveResult {
-  status: 'done' | 'retryable_error' | 'fatal_error' | 'timeout';
+  status: 'done' | 'retryable_error' | 'fatal_error' | 'upgrade_required' | 'timeout';
   text: string;
 }
+
 
 /**
  * 統一的運行狀態判斷函式（瀏覽器環境執行）
@@ -30,7 +34,7 @@ function isModelRunning(stopSelector: string): boolean {
   return text.includes('stop');
 }
 
-async function dismissAiStudioDialogs(page: Page): Promise<void> {
+async function dismissDialogs(page: Page): Promise<void> {
   const dialogSelectors = [
     '#g1-welcome-dialog button[aria-label="Close dialog"], ms-g1-welcome-dialog button.ms-button-primary, #g1-welcome-dialog button:has-text("Continue")',
     'ms-auth-request-dialog button[aria-label="Cancel"], ms-auth-request-dialog button:has-text("Cancel and use Temporary chat")',
@@ -41,8 +45,8 @@ async function dismissAiStudioDialogs(page: Page): Promise<void> {
   for (const selector of dialogSelectors) {
     try {
       const btn = page.locator(selector).first();
-      if (await btn.isVisible({ timeout: 80 }).catch(() => false)) {
-        await btn.click({ timeout: 1000 }).catch(() => {});
+      if (await btn.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await btn.click({ timeout: 5000 }).catch(() => { });
       }
     } catch {
       // 忽略單一彈窗檢查例外
@@ -51,10 +55,8 @@ async function dismissAiStudioDialogs(page: Page): Promise<void> {
 }
 
 export class AiStudioProvider extends WebAiProvider {
-  readonly name = 'aistudio';
+  readonly name = 'Google AI Studio';
   readonly baseUrl = 'https://aistudio.google.com/prompts/new_chat';
-
-  private readonly stoppingPromises = new WeakMap<Page, Promise<void>>();
 
   private readonly selectors = {
     PROMPT_INPUT:
@@ -75,116 +77,211 @@ export class AiStudioProvider extends WebAiProvider {
     TURN_ITEM: 'ms-chat-turn .chat-turn-container.model, ms-chat-turn[data-turn-role="Model"]',
     MODEL_ERROR: '.model-error, [class*="model-error"]',
     THINKING_SELECT: 'mat-select[aria-label="Thinking Level"]',
-    THINKING_SELECT_VALUE: '.mat-mdc-select-min-line, .mat-mdc-select-value-text',
+    THINKING_SELECT_VALUE: '.mat-mdc-select-min-line',
     THINKING_PANEL: '.mat-mdc-select-panel[aria-label="Thinking Level"], .mat-mdc-select-panel',
+    MODEL_SELECTOR_BUTTON: 'button.model-selector-card.ng-star-inserted',
+    MODEL_SELECTOR_NAME: '[data-test-id=model-name]',
+    MODEL_PANEL_CLOSE_BUTTON: 'button[aria-label="Close panel"]',
+    OUTPUT_LENGTH_INPUT: 'input[name=maxOutputTokens], input[aria-describedby=output-length-hint]',
     SCROLL_CONTAINER: 'ms-autoscroll-container',
+    UPGRADE_DIALOG:
+      'ms-upgrade-options-dialog, ms-upgrade-options[presentation="dialog"], .upgrade-modal-container',
+    UPGRADE_DIALOG_CLOSE_BUTTON:
+      'ms-upgrade-options-dialog button[aria-label="close"], ms-upgrade-options-dialog button.close-button, .upgrade-modal-container button[aria-label="close"], .upgrade-modal-container button.close-button',
   } as const;
 
-  public async isModelRunning(page: Page): Promise<boolean> {
-    return await page
-      .evaluate(isModelRunning, this.selectors.SEND_OR_STOP_BUTTON)
-      .catch(() => false);
-  }
+  private readonly upgradeDialogErrorMessage =
+    '[Error]: Paid upgrade dialog ("Go further with AI Studio") detected and closed. Please upgrade your plan, switch to an available model, or configure API billing.';
 
-  public async stop(worker: PageWorker): Promise<void> {
-    const existing = this.stoppingPromises.get(worker.page);
-    if (existing) {
-      return existing;
-    }
-
-    const promise = (async () => {
-      try {
-        this.dirtyPages.add(worker.page);
-        console.log(`[${this.name}] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
-
-        await worker.page.waitForFunction(
-          isModelRunning,
-          this.selectors.SEND_OR_STOP_BUTTON,
-          { timeout: 5000 }
-        );
-
-        console.log(`[${this.name}] Worker #${worker.id} model confirmed running. Clicking SEND_OR_STOP_BUTTON...`);
-        const stopBtn = worker.page.locator(this.selectors.SEND_OR_STOP_BUTTON).first();
-        await stopBtn.click({ timeout: 2000 });
-      } catch (err) {
-        console.warn(`[${this.name}] Worker #${worker.id} stop execution warning:`, err);
-      }
-    })();
-
-    this.stoppingPromises.set(worker.page, promise);
+  private async dismissUpgradeDialog(page: Page): Promise<boolean> {
     try {
-      await promise;
-    } finally {
-      this.stoppingPromises.delete(worker.page);
+      const dialog = page.locator(this.selectors.UPGRADE_DIALOG).first();
+      const isDialogVisible = await dialog.isVisible().catch(() => false);
+      if (!isDialogVisible) return false;
+
+      console.warn(`[${this.name}] Paid upgrade dialog detected. Clicking close button...`);
+      const closeBtn = dialog.locator('button[aria-label="close"], button.close-button').first();
+      await closeBtn.click({ timeout: 5000 });
+
+      return true;
+    } catch {
+      return false;
     }
   }
 
-  public mapThinkingLevel(effort?: string): 'Low' | 'Medium' | 'High' | null {
-    if (!effort) return null;
-    const normalized = effort.trim().toLowerCase().replace(/[-_]/g, '');
-
-    if (['none', 'low'].includes(normalized)) return 'Low';
-    if (['medium'].includes(normalized)) return 'Medium';
-    if (['high', 'xhigh', 'extrahigh'].includes(normalized)) return 'High';
-
-    return null;
+  protected override async executeStop(worker: PageWorker): Promise<void> {
+    await this.stopTemplate(worker, {
+      isRunningFn: isModelRunning,
+      isRunningArg: this.selectors.SEND_OR_STOP_BUTTON,
+      stopButtonSelector: this.selectors.SEND_OR_STOP_BUTTON,
+    });
   }
 
-  public async setThinkingLevel(page: Page, level?: string): Promise<void> {
-    const targetLevel = this.mapThinkingLevel(level);
-    if (!targetLevel) return;
+  protected override async setModel(page: Page, model?: string): Promise<void> {
+    const targetModel = model?.trim().toLowerCase();
+    if (!targetModel) return;
+
+    try {
+      const selectorBtn = page.locator(this.selectors.MODEL_SELECTOR_BUTTON).first();
+      const isBtnVisible = await selectorBtn
+        .waitFor({ state: 'visible', timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+
+      if (!isBtnVisible) {
+        console.warn(`[${this.name}] Model selector button not found or not visible.`);
+        return;
+      }
+
+      const currentModelName = (
+        (await selectorBtn
+          .locator(this.selectors.MODEL_SELECTOR_NAME)
+          .first()
+          .textContent({ timeout: 5000 })
+          .catch(() => '')) ?? ''
+      )
+        .trim()
+        .toLowerCase();
+
+      if (currentModelName && currentModelName.endsWith(targetModel)) {
+        return;
+      }
+
+      await selectorBtn.scrollIntoViewIfNeeded().catch(() => { });
+      await selectorBtn.click({ timeout: 5000 });
+
+      const closeBtn = page.locator(this.selectors.MODEL_PANEL_CLOSE_BUTTON).first();
+      await closeBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => { });
+
+      const optionSelector = `button[id$=${JSON.stringify(targetModel)}]`;
+      const optionLocator = page.locator(optionSelector).first();
+      const isOptionVisible = await optionLocator
+        .waitFor({ state: 'visible', timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+
+      if (isOptionVisible && !(await optionLocator.isDisabled().catch(() => false))) {
+        console.log(`[${this.name}] Selecting model: "${targetModel}"...`);
+        await optionLocator.scrollIntoViewIfNeeded().catch(() => { });
+        await optionLocator.click({ timeout: 5000 });
+        await closeBtn.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => { });
+        console.log(`[${this.name}] Successfully applied model: "${targetModel}"`);
+      } else {
+        if (!isOptionVisible) {
+          console.warn(`[${this.name}] Model "${targetModel}" not found (selector: ${optionSelector}). Closing panel...`);
+        }
+        if (await closeBtn.isVisible().catch(() => false)) {
+          await closeBtn.click({ timeout: 5000 }).catch(() => { });
+          await closeBtn.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => { });
+        } else {
+          await page.keyboard.press('Escape').catch(() => { });
+        }
+      }
+    } catch (err) {
+      console.warn(`[${this.name}] setModel error:`, err);
+      const closeBtn = page.locator(this.selectors.MODEL_PANEL_CLOSE_BUTTON).first();
+      if (await closeBtn.isVisible().catch(() => false)) {
+        await closeBtn.click({ timeout: 5000 }).catch(() => { });
+      } else {
+        await page.keyboard.press('Escape').catch(() => { });
+      }
+    }
+  }
+
+  protected override async setThinkingLevel(page: Page, level?: string): Promise<void> {
+    if (!level) return;
+    let targetLevel: 'low' | 'medium' | 'high';
+    const normalized = level.trim().toLowerCase().replace(/[-_]/g, '');
+    if (['none', 'low'].includes(normalized))
+      targetLevel = 'low';
+    else if (['medium'].includes(normalized))
+      targetLevel = 'medium';
+    else if (['high', 'xhigh', 'extrahigh'].includes(normalized))
+      targetLevel = 'high';
+    else
+      return;
 
     try {
       const selectLocator = page.locator(this.selectors.THINKING_SELECT).first();
-      if (!(await selectLocator.isVisible({ timeout: 2000 }).catch(() => false))) {
+      if (!(await selectLocator.isVisible({ timeout: 5000 }).catch(() => false)))
         return;
-      }
 
       const currentVal = (
-        await selectLocator.locator(this.selectors.THINKING_SELECT_VALUE).innerText().catch(() => '')
+        await selectLocator.locator(this.selectors.THINKING_SELECT_VALUE).textContent() ?? ''
       ).trim();
 
-      if (currentVal.toLowerCase() === targetLevel.toLowerCase()) {
+      if (currentVal.toLowerCase() === targetLevel)
         return;
-      }
 
       console.log(`[${this.name}] Changing Thinking Level from "${currentVal}" to "${targetLevel}"...`);
-      await selectLocator.scrollIntoViewIfNeeded().catch(() => {});
-      await selectLocator.click({ timeout: 2000 });
+      await selectLocator.scrollIntoViewIfNeeded().catch(() => { });
+      await selectLocator.click({ timeout: 5000 });
 
       const optionLocator = page
         .locator(`${this.selectors.THINKING_PANEL} mat-option`)
         .filter({ hasText: new RegExp(`^\\s*${targetLevel}\\s*$`, 'i') })
         .first();
 
-      if (await optionLocator.isVisible({ timeout: 2500 }).catch(() => false)) {
-        await optionLocator.click({ timeout: 2000 });
+      if (await optionLocator.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await optionLocator.click({ timeout: 5000 });
         console.log(`[${this.name}] Successfully applied Thinking Level: "${targetLevel}"`);
       } else {
-        await page.keyboard.press('Escape').catch(() => {});
+        await page.keyboard.press('Escape').catch(() => { });
       }
 
-      await page.waitForSelector('.cdk-overlay-pane:has(mat-option)', { state: 'detached', timeout: 1500 }).catch(async () => {
-        await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForSelector('.cdk-overlay-pane:has(mat-option)', { state: 'detached', timeout: 5000 }).catch(async () => {
+        await page.keyboard.press('Escape').catch(() => { });
       });
     } catch (err) {
-      console.warn('[${this.name}] setThinkingLevel error:', err);
-      await page.keyboard.press('Escape').catch(() => {});
+      console.warn(`[${this.name}] setThinkingLevel error:`, err);
+      await page.keyboard.press('Escape').catch(() => { });
     }
   }
 
-  public async ensureRawModeEnabled(page: Page): Promise<void> {
+  protected async ensureOutputLength(page: Page): Promise<void> {
+    const targetOutputLength = '1048576';
+    try {
+      const outputLengthInput = page.locator(this.selectors.OUTPUT_LENGTH_INPUT).first();
+      const isOutputLengthVisible = await outputLengthInput
+        .waitFor({ state: 'visible', timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+
+      if (!isOutputLengthVisible) {
+        console.warn('[' + this.name + '] Output Length input not found or not visible.');
+        return;
+      }
+
+      const currentVal = (await outputLengthInput.inputValue().catch(() => '')).trim();
+      if (currentVal === targetOutputLength) {
+        return;
+      }
+
+      console.log('[' + this.name + '] Changing Output Length from ' + currentVal + ' to ' + targetOutputLength + '...');
+      await outputLengthInput.scrollIntoViewIfNeeded().catch(() => { });
+      await outputLengthInput.click({ timeout: 5000 });
+      await outputLengthInput.fill('');
+      await outputLengthInput.fill(targetOutputLength);
+      await outputLengthInput.dispatchEvent('input');
+      await outputLengthInput.dispatchEvent('change');
+      await outputLengthInput.blur().catch(() => { });
+      console.log('[' + this.name + '] Successfully applied Output Length: ' + targetOutputLength);
+    } catch (err) {
+      console.warn('[' + this.name + '] ensureOutputLength notice:', err);
+    }
+  }
+
+  protected async ensureRawModeEnabled(page: Page): Promise<void> {
+    await this.ensureOutputLength(page);
     try {
       const moreActionsLocator = page.locator(this.selectors.VIEW_MORE_ACTIONS_BUTTON);
       if ((await moreActionsLocator.count()) === 0) return;
 
       const moreActionsBtn = moreActionsLocator.last();
-      await moreActionsBtn.waitFor({ state: 'visible', timeout: 2000 });
-      await moreActionsBtn.scrollIntoViewIfNeeded().catch(() => {});
-      await moreActionsBtn.click({ timeout: 2000 });
+      await moreActionsBtn.click({ timeout: 5000 });
 
       const rawModeBtn = page.locator(this.selectors.RAW_MODE_BUTTON).first();
-      await rawModeBtn.waitFor({ state: 'visible', timeout: 2500 });
+      await rawModeBtn.waitFor({ state: 'visible', timeout: 5000 });
 
       const checkmarkInBtn = rawModeBtn.locator(this.selectors.RAW_MODE_CHECKMARK);
       const globalCheckmark = page.locator(this.selectors.RAW_MODE_CHECKMARK);
@@ -194,20 +291,20 @@ export class AiStudioProvider extends WebAiProvider {
         (await globalCheckmark.count()) > 0;
 
       if (!hasCheckmark) {
-        console.log('[${this.name}] Checkmark not found. Enabling Raw Mode...');
-        await rawModeBtn.click({ timeout: 2000 });
+        console.log(`[${this.name}] Checkmark not found. Enabling Raw Mode...`);
+        await rawModeBtn.click({ timeout: 5000 });
       } else {
-        await page.keyboard.press('Escape').catch(() => {});
+        await page.keyboard.press('Escape').catch(() => { });
       }
     } catch (err) {
-      console.warn('[${this.name}] ensureRawModeEnabled notice:', err);
-      await page.keyboard.press('Escape').catch(() => {});
+      console.warn(`[${this.name}] ensureRawModeEnabled notice:`, err);
+      await page.keyboard.press('Escape').catch(() => { });
     }
   }
 
-  async uploadFile(page: Page, filePath: string): Promise<void> {
+  override async uploadFile(page: Page, filePath: string): Promise<void> {
     console.log(`[${this.name}] Uploading attachment file: ${filePath}`);
-    await dismissAiStudioDialogs(page);
+    await dismissDialogs(page);
 
     const directFileInput = page.locator(this.selectors.FILE_INPUT).first();
     if ((await directFileInput.count()) > 0) {
@@ -219,7 +316,7 @@ export class AiStudioProvider extends WebAiProvider {
 
       const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 25000 });
       const uploadItem = page.locator(this.selectors.UPLOAD_FILE_MENU_ITEM).first();
-      if (await uploadItem.isVisible({ timeout: 3000 }).catch(() => false)) {
+      if (await uploadItem.isVisible({ timeout: 5000 }).catch(() => false)) {
         await uploadItem.click();
       } else {
         await page.keyboard.press('Enter');
@@ -229,13 +326,12 @@ export class AiStudioProvider extends WebAiProvider {
       await fileChooser.setFiles(filePath);
     }
 
-    console.log('[${this.name}] Attachment uploaded and mounted.');
+    console.log(`[${this.name}] Attachment uploaded and mounted.`);
   }
 
-  async navigateConversation(
+  override async navigateConversation(
     page: Page,
-    isNewConversation: boolean,
-    targetPath?: string
+    isNewConversation: boolean
   ): Promise<void> {
     if (isNewConversation) {
       const existingTurns = await page.locator(this.selectors.CHAT_TURN).count().catch(() => 0);
@@ -252,11 +348,11 @@ export class AiStudioProvider extends WebAiProvider {
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
         this.dirtyPages.delete(page);
       }
-      await dismissAiStudioDialogs(page);
+      await dismissDialogs(page);
       await this.ensureRawModeEnabled(page);
     } else {
       console.log(`[${this.name}] Continuing in existing conversation tab (no reload).`);
-      await dismissAiStudioDialogs(page);
+      await dismissDialogs(page);
     }
   }
 
@@ -274,80 +370,128 @@ export class AiStudioProvider extends WebAiProvider {
       el.value = '';
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-    }).catch(() => {});
+    }).catch(() => { });
     await input.fill('');
-    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
-    await page.keyboard.press('Backspace').catch(() => {});
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => { });
+    await page.keyboard.press('Backspace').catch(() => { });
 
     await input.fill(prompt);
     await input.dispatchEvent('input');
     await input.dispatchEvent('change');
 
-    await dismissAiStudioDialogs(page);
+    await dismissDialogs(page);
 
     const sendBtn = page.locator(this.selectors.SEND_OR_STOP_BUTTON).first();
     let sent = false;
 
     try {
-      await sendBtn.waitFor({ state: 'visible', timeout: 5000 });
-      if (await sendBtn.isEnabled({ timeout: 5000 }).catch(() => false)) {
-        await sendBtn.click({ timeout: 2000 });
-        sent = true;
-      }
+      await sendBtn.click({ timeout: 5000 });
+      sent = true;
     } catch {
       // Fallback
     }
 
     if (!sent) {
       await input.focus();
-      await page.keyboard.press('Enter');
+      await page.keyboard.press('Control+Enter');
     }
 
     await page.waitForTimeout(600);
     const remainingVal = await input.inputValue().catch(() => '');
     if (remainingVal.trim().length > 0) {
-      console.log('[${this.name}] Prompt remaining in input box, executing forced submit...');
-      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      console.log(`[${this.name}] Prompt remaining in input box, executing forced submit...`);
+      await sendBtn.click({ force: true, timeout: 5000 }).catch(() => { });
       await input.focus();
-      await page.keyboard.press('Enter');
+      await page.keyboard.press('Control+Enter');
     }
   }
 
-  async sendPromptAndObserve(
+  private async waitForTurnOrUpgradeDialog(
+    page: Page,
+    prevSnapshot: number
+  ): Promise<'turn' | 'upgrade_dialog'> {
+    const handle = await page.waitForFunction(
+      ({ turnSelector, prevSnapshot, upgradeDialogSelector }: WaitForTurnParams) => {
+        const upgradeEl = document.querySelector(upgradeDialogSelector) as HTMLElement | null;
+        if (upgradeEl) {
+          const rect = upgradeEl.getBoundingClientRect();
+          if (upgradeEl.offsetParent !== null || (rect.width > 0 && rect.height > 0)) {
+            return 'upgrade_dialog';
+          }
+        }
+
+        const dialogActionSelectors = [
+          '#g1-welcome-dialog button',
+          'ms-g1-welcome-dialog button',
+          'ms-auth-request-dialog button',
+          '#copyright-acknowledgement-dialog button',
+          'ms-copyright-acknowledgement-dialog button',
+          'ms-inline-preference-vote button[data-test-id="skip-button"]',
+          'button[aria-label="Skip preference vote"]',
+        ];
+        for (const sel of dialogActionSelectors) {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (el && el.offsetParent !== null) {
+            el.click();
+          }
+        }
+
+        if (document.querySelectorAll(turnSelector).length > prevSnapshot) {
+          return 'turn';
+        }
+        return false;
+      },
+      {
+        turnSelector: this.selectors.TURN_ITEM,
+        prevSnapshot,
+        upgradeDialogSelector: this.selectors.UPGRADE_DIALOG,
+      },
+      { timeout: 30000 }
+    );
+
+    const outcome = await handle.jsonValue().catch(() => 'turn' as const);
+    await handle.dispose().catch(() => { });
+    return outcome === 'upgrade_dialog' ? 'upgrade_dialog' : 'turn';
+  }
+
+  override async sendPromptAndObserve(
     worker: PageWorker,
     prompt: string,
     onRawChunk: (delta: string, isReasoning?: boolean) => void,
-    options?: { thinkingLevel?: string; abortSignal?: AbortSignal }
+    options?: SendPromptOptions
   ): Promise<{ rawText: string; currentPath: string }> {
     const { page, emitter, id } = worker;
-    const currentUrlObj = new URL(page.url());
-    const currentPath = currentUrlObj.pathname;
 
     let isWatchingDialogs = true;
     let dialogWatcherPromise: Promise<void> | null = null;
 
     try {
-      if (options?.abortSignal?.aborted) {
-        this.dirtyPages.add(page);
-        throw new Error('Chat generation aborted before prompt submission.');
-      }
-
-      await dismissAiStudioDialogs(page);
-      await this.setThinkingLevel(page, options?.thinkingLevel);
+      await dismissDialogs(page);
+      const result = await super.sendPromptAndObserve(worker, prompt, onRawChunk, options);
+      if (result)
+        return result;
 
       let turnSnapshot = await this.getTurnSnapshot(page);
       console.log(`[${this.name}] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
 
       await this.submitPrompt(page, prompt);
 
+      if (await this.dismissUpgradeDialog(page)) {
+        this.dirtyPages.add(page);
+        return {
+          rawText: this.upgradeDialogErrorMessage,
+          currentPath: this.getCurrentPath(page),
+        };
+      }
+
       dialogWatcherPromise = (async () => {
         while (isWatchingDialogs) {
           try {
-            await dismissAiStudioDialogs(page);
+            await dismissDialogs(page);
           } catch {
             // 忽略輪詢異常
           }
-          await page.waitForTimeout(300).catch(() => {});
+          await page.waitForTimeout(300).catch(() => { });
         }
       })();
 
@@ -365,33 +509,16 @@ export class AiStudioProvider extends WebAiProvider {
             scroller.scrollTop = scroller.scrollHeight;
           }
         }, this.selectors.SCROLL_CONTAINER)
-        .catch(() => {});
+        .catch(() => { });
 
-      await page.waitForFunction(
-        ({ turnSelector, prevSnapshot }: WaitForTurnParams) => {
-          const dialogActionSelectors = [
-            '#g1-welcome-dialog button',
-            'ms-g1-welcome-dialog button',
-            'ms-auth-request-dialog button',
-            '#copyright-acknowledgement-dialog button',
-            'ms-copyright-acknowledgement-dialog button',
-            'ms-inline-preference-vote button[data-test-id="skip-button"]',
-            'button[aria-label="Skip preference vote"]',
-          ];
-          for (const sel of dialogActionSelectors) {
-            const el = document.querySelector(sel) as HTMLElement | null;
-            if (el && el.offsetParent !== null) {
-              el.click();
-            }
-          }
-          return document.querySelectorAll(turnSelector).length > prevSnapshot;
-        },
-        {
-          turnSelector: this.selectors.TURN_ITEM,
-          prevSnapshot: turnSnapshot,
-        },
-        { timeout: 30000 }
-      );
+      const waitOutcome = await this.waitForTurnOrUpgradeDialog(page, turnSnapshot);
+      if (waitOutcome === 'upgrade_dialog' || (await this.dismissUpgradeDialog(page))) {
+        this.dirtyPages.add(page);
+        return {
+          rawText: this.upgradeDialogErrorMessage,
+          currentPath: this.getCurrentPath(page),
+        };
+      }
 
       console.log(`[${this.name}] Worker #${id} new model turn detected.`);
 
@@ -423,7 +550,8 @@ export class AiStudioProvider extends WebAiProvider {
       const maxRetries = 20;
 
       try {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        let attempt;
+        for (attempt = 1; attempt <= maxRetries; attempt++) {
           if (options?.abortSignal?.aborted) {
             await this.stop(worker);
             finalMainText = '[Generation Aborted by Client]';
@@ -433,8 +561,16 @@ export class AiStudioProvider extends WebAiProvider {
           await this.ensureBrowserHelpers(page);
 
           const evalPromise = page.evaluate(
-            ({ turnSelector, scrollSelector, stopSelector, isModelRunningCode, prevSnapshot }: ObserveStreamParams) => {
-              return new Promise<ObserveResult>((resolve) => {
+            ({
+              turnSelector,
+              scrollSelector,
+              stopSelector,
+              upgradeDialogSelector,
+              upgradeErrorMessage,
+              isModelRunningCode,
+              prevSnapshot,
+            }: ObserveStreamParams) => {
+              return new Promise<ObserveResult>(async (resolve) => {
                 const customWindow = window as unknown as WindowWithCustomEvents;
                 const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
                 const checkRunning = rehydrate(isModelRunningCode);
@@ -624,7 +760,7 @@ export class AiStudioProvider extends WebAiProvider {
                 let lastChangeTime = Date.now();
                 let isDone = false;
 
-                function emitDelta(): void {
+                async function emitDelta() {
                   if (isDone) return;
 
                   const currentThought = getThoughtText();
@@ -632,7 +768,7 @@ export class AiStudioProvider extends WebAiProvider {
                     const thoughtDelta = currentThought.slice(lastThoughtLen);
                     lastThoughtLen = currentThought.length;
                     lastChangeTime = Date.now();
-                    customWindow.__pushChunk(
+                    await customWindow.__pushChunk(
                       JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
                     );
                   }
@@ -642,7 +778,7 @@ export class AiStudioProvider extends WebAiProvider {
                     const mainDelta = currentMain.slice(lastMainLen);
                     lastMainLen = currentMain.length;
                     lastChangeTime = Date.now();
-                    customWindow.__pushChunk(
+                    await customWindow.__pushChunk(
                       JSON.stringify({ type: 'content', delta: mainDelta })
                     );
                   }
@@ -700,10 +836,21 @@ export class AiStudioProvider extends WebAiProvider {
                     }
                   }
 
-                  emitDelta();
+                  await emitDelta();
 
                   const currentMain = getMainText();
                   const hasGeneratedAny = lastThoughtLen > 0 || lastMainLen > 0;
+
+                  if (!hasGeneratedAny) {
+                    const upgradeEl = document.querySelector(upgradeDialogSelector) as HTMLElement | null;
+                    if (upgradeEl) {
+                      const rect = upgradeEl.getBoundingClientRect();
+                      if (upgradeEl.offsetParent !== null || (rect.width > 0 && rect.height > 0)) {
+                        void finish('upgrade_required', upgradeErrorMessage);
+                        return;
+                      }
+                    }
+                  }
 
                   if (!running && currentMain.includes('@use_mcp_tool') && hasCompleteToolCall(currentMain)) {
                     void finish('done', currentMain);
@@ -722,13 +869,15 @@ export class AiStudioProvider extends WebAiProvider {
                   }
                 }, 200);
 
-                emitDelta();
+                await emitDelta();
               });
             },
             {
               turnSelector: this.selectors.TURN_ITEM,
               scrollSelector: this.selectors.SCROLL_CONTAINER,
               stopSelector: this.selectors.SEND_OR_STOP_BUTTON,
+              upgradeDialogSelector: this.selectors.UPGRADE_DIALOG,
+              upgradeErrorMessage: this.upgradeDialogErrorMessage,
               isModelRunningCode: isModelRunning.toString(),
               prevSnapshot: turnSnapshot,
             }
@@ -748,6 +897,13 @@ export class AiStudioProvider extends WebAiProvider {
 
           const evalResult = await Promise.race([evalPromise, abortPromise]);
 
+          if (evalResult.status === 'upgrade_required') {
+            await this.dismissUpgradeDialog(page);
+            this.dirtyPages.add(page);
+            finalMainText = evalResult.text;
+            break;
+          }
+
           if (options?.abortSignal?.aborted || evalResult.status === 'timeout') {
             await this.stop(worker);
             finalMainText = evalResult.text;
@@ -759,21 +915,22 @@ export class AiStudioProvider extends WebAiProvider {
               `[${this.name}] Worker #${id} Retryable error occurred (${evalResult.text}). Retry after 2 seconds (${attempt}/${maxRetries})...`
             );
             await page.waitForTimeout(2000);
-            await dismissAiStudioDialogs(page);
+            await dismissDialogs(page);
 
             turnSnapshot = await this.getTurnSnapshot(page);
             await this.submitPrompt(page, prompt);
+            if (await this.dismissUpgradeDialog(page)) {
+              this.dirtyPages.add(page);
+              finalMainText = this.upgradeDialogErrorMessage;
+              break;
+            }
 
-            await page.waitForFunction(
-              ({ turnSelector, prevSnapshot }: WaitForTurnParams) => {
-                return document.querySelectorAll(turnSelector).length > prevSnapshot;
-              },
-              {
-                turnSelector: this.selectors.TURN_ITEM,
-                prevSnapshot: turnSnapshot,
-              },
-              { timeout: 30000 }
-            );
+            const retryWaitOutcome = await this.waitForTurnOrUpgradeDialog(page, turnSnapshot);
+            if (retryWaitOutcome === 'upgrade_dialog' || (await this.dismissUpgradeDialog(page))) {
+              this.dirtyPages.add(page);
+              finalMainText = this.upgradeDialogErrorMessage;
+              break;
+            }
 
             rawFullMainText = '';
             continue;
@@ -784,7 +941,8 @@ export class AiStudioProvider extends WebAiProvider {
         }
 
         if (!finalMainText) {
-          finalMainText = `[Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
+          if (attempt > maxRetries)
+            finalMainText = `[Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
         }
       } finally {
         if (finalMainText.length > rawFullMainText.length) {
@@ -795,23 +953,23 @@ export class AiStudioProvider extends WebAiProvider {
         emitter.off('chunk', chunkListener);
       }
 
-      await dismissAiStudioDialogs(page);
+      await dismissDialogs(page);
       const resolvedText = finalMainText.trim() ? finalMainText : rawFullMainText;
 
       console.log(`[${this.name}] Worker #${id} generation completed. Total main chars: ${resolvedText.length}`);
-      return { rawText: resolvedText, currentPath };
+      return { rawText: resolvedText, currentPath: this.getCurrentPath(page) };
     } catch (err) {
       this.dirtyPages.add(page);
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error(`[${this.name}] Worker #${id} unexpected error:`, errorMsg);
       return {
         rawText: `[Error]: ${errorMsg}`,
-        currentPath,
+        currentPath: this.getCurrentPath(page),
       };
     } finally {
       isWatchingDialogs = false;
       if (dialogWatcherPromise) {
-        await dialogWatcherPromise.catch(() => {});
+        await dialogWatcherPromise.catch(() => { });
       }
     }
   }

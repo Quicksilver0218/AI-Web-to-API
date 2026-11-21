@@ -171,6 +171,7 @@ export async function startServer(
       let activeWorker: PageWorker | null = null;
       const socket = req.socket;
       let wakeUpTimer: NodeJS.Timeout | null = null;
+      let isResponseCompleted = false;
 
       const stopWakeUp = () => {
         if (wakeUpTimer) {
@@ -196,10 +197,12 @@ export async function startServer(
       };
       currentRunningTask = thisTask;
 
-      const handleClientAbort = () => {
+      const handleClientAbort = (reason: string) => {
         stopWakeUp();
+        if (isResponseCompleted || res.writableEnded || res.writableFinished)
+          return;
         if (!abortController.signal.aborted) {
-          console.warn(`[Server] Task #${taskId}: Client connection closed prematurely (Cancel pressed). Aborting browser generation...`);
+          console.warn(`[Server] Task #${taskId}: Client connection closed prematurely (${reason}). Aborting browser generation...`);
           abortController.abort();
           if (activeWorker) {
             provider.markPageDirty(activeWorker.page);
@@ -210,15 +213,32 @@ export async function startServer(
         }
       };
 
-      res.on('close', handleClientAbort);
-      socket.on('close', handleClientAbort);
-      req.on('aborted', handleClientAbort);
+      const onResClose = () => handleClientAbort('Response Closed');
+      const onSocketClose = () => handleClientAbort('Socket Closed');
+      const onReqAborted = () => handleClientAbort('Request Aborted');
+      const onResFinish = () => {
+        isResponseCompleted = true;
+        cleanupConnectionListeners();
+      };
+
+      const cleanupConnectionListeners = () => {
+        res.off('close', onResClose);
+        res.off('finish', onResFinish);
+        socket.off('close', onSocketClose);
+        req.off('aborted', onReqAborted);
+      };
+
+      res.on('close', onResClose);
+      res.on('finish', onResFinish);
+      socket.on('close', onSocketClose);
+      req.on('aborted', onReqAborted);
 
       try {
         const rawBody = await parseJsonBody(req);
         const messages = rawBody.messages ?? [];
 
         if (!Array.isArray(messages) || messages.length === 0) {
+          isResponseCompleted = true;
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'messages must be a non-empty array' }));
           return;
@@ -232,10 +252,11 @@ export async function startServer(
         );
 
         const rawThinkingHeader = req.headers['thinking'];
-        const thinkingVal = (Array.isArray(rawThinkingHeader) ? rawThinkingHeader[0] : rawThinkingHeader ?? '').trim();
+        const thinkingVal = (Array.isArray(rawThinkingHeader) ? rawThinkingHeader[0] : rawThinkingHeader ?? '').trim() || undefined;
 
         const isStream = rawBody.stream === true;
-        const modelName = rawBody.model ?? `${provider.name}-playwright-pool`;
+        const requestedModel = typeof rawBody.model === 'string' ? rawBody.model.trim() || undefined : undefined;
+        const modelName = requestedModel || `${provider.name}-playwright-pool`;
 
         if (isStream) {
           res.writeHead(200, {
@@ -246,10 +267,9 @@ export async function startServer(
           });
           res.flushHeaders();
 
-          // 核心解決方案：前置準備階段每 400ms 送出零寬度字元 \u200B
-          // 讓 Cline 的 for await 立即能被消費並檢查 this.abort，一旦按下 Cancel 可以在 400ms 內中斷 Socket
+          // 前置準備階段每 400ms 送出零寬度字元 \u200B，讓 Cline 消費迴圈保持活躍
           wakeUpTimer = setInterval(() => {
-            if (res.writableEnded || abortController.signal.aborted || socket.destroyed) {
+            if (isResponseCompleted || res.writableEnded || abortController.signal.aborted || socket.destroyed) {
               stopWakeUp();
               return;
             }
@@ -290,11 +310,12 @@ export async function startServer(
               isNewConversation,
               targetPath,
               tools: rawBody.tools,
-              thinkingLevel: thinkingVal || undefined,
+              model: requestedModel,
+              thinkingLevel: thinkingVal,
               abortSignal: abortController.signal,
               onReasoningDelta: (delta: string) => {
                 stopWakeUp();
-                if (res.writableEnded || abortController.signal.aborted || socket.destroyed) return;
+                if (isResponseCompleted || res.writableEnded || abortController.signal.aborted || socket.destroyed) return;
                 const reasoningPayload: ChatCompletionChunk = {
                   id: `chatcmpl-${Date.now()}`,
                   object: 'chat.completion.chunk',
@@ -315,7 +336,7 @@ export async function startServer(
               },
               onTextDelta: (delta: string) => {
                 stopWakeUp();
-                if (res.writableEnded || abortController.signal.aborted || socket.destroyed) return;
+                if (isResponseCompleted || res.writableEnded || abortController.signal.aborted || socket.destroyed) return;
                 const chunkPayload: ChatCompletionChunk = {
                   id: `chatcmpl-${Date.now()}`,
                   object: 'chat.completion.chunk',
@@ -397,6 +418,12 @@ export async function startServer(
                 res.write(`data: ${JSON.stringify(finishPayload)}\n\n`);
               }
 
+              // 標記任務已正常完成，避免後續 res.end() 觸發 close 事件誤報
+              isResponseCompleted = true;
+              if (currentRunningTask === thisTask) {
+                currentRunningTask = null;
+              }
+
               res.write('data: [DONE]\n\n');
               res.end();
             }
@@ -407,7 +434,8 @@ export async function startServer(
               isNewConversation,
               targetPath,
               tools: rawBody.tools,
-              thinkingLevel: thinkingVal || undefined,
+              model: requestedModel,
+              thinkingLevel: thinkingVal,
               abortSignal: abortController.signal,
             });
 
@@ -456,12 +484,18 @@ export async function startServer(
                 ],
               };
 
+              isResponseCompleted = true;
+              if (currentRunningTask === thisTask) {
+                currentRunningTask = null;
+              }
+
               res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
               res.end(JSON.stringify(payload));
             }
           }
         } finally {
           stopWakeUp();
+          cleanupConnectionListeners();
           if (currentRunningTask === thisTask) {
             currentRunningTask = null;
           }
@@ -470,15 +504,18 @@ export async function startServer(
         }
       } catch (err: unknown) {
         stopWakeUp();
+        cleanupConnectionListeners();
         if (currentRunningTask === thisTask) {
           currentRunningTask = null;
         }
         const errMsg = getErrorMessage(err);
         console.error(`[Server Error Task #${taskId}]:`, errMsg);
         if (!res.headersSent && !res.writableEnded && !socket.destroyed) {
+          isResponseCompleted = true;
           res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: errMsg }));
         } else if (!res.writableEnded && !socket.destroyed) {
+          isResponseCompleted = true;
           res.end();
         }
       }

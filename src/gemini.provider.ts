@@ -1,5 +1,5 @@
 import type { Page } from 'playwright';
-import { WebAiProvider } from './web-ai-provider.js';
+import { WebAiProvider, type SendPromptOptions } from './web-ai-provider.js';
 import type { PageWorker, WindowWithCustomEvents } from './types.ts';
 
 interface WaitForTurnParams {
@@ -29,10 +29,8 @@ function isModelRunning(stopSelector: string): boolean {
 }
 
 export class GeminiProvider extends WebAiProvider {
-  readonly name = 'gemini';
+  readonly name = 'Gemini';
   readonly baseUrl = 'https://gemini.google.com/app';
-
-  private readonly stoppingPromises = new WeakMap<Page, Promise<void>>();
 
   private readonly selectors = {
     PROMPT_INPUT: 'div[contenteditable="true"], div.ql-editor',
@@ -49,82 +47,109 @@ export class GeminiProvider extends WebAiProvider {
       '[data-test-id="upload-image-agree-button"] button, button[aria-label*="同意"], button[aria-label*="Agree"]',
     ATTACHMENT_PREVIEW: 'uploader-file-preview, .attachment-preview-wrapper, gem-attachment',
     MODEL_PICKER_BUTTON: 'button[data-test-id="bard-mode-menu-button"]',
+    MODEL_MENU_ITEM: 'gem-menu-item.ng-star-inserted',
+    LIST_VIEW_BUTTON: 'compact-periodic-picker button.list-view-btn, button.compact-btn.list-view-btn',
+    PICKER_MENU_OVERLAY:
+      '.cdk-overlay-pane:has(gem-menu, gem-menu-item, compact-periodic-picker, [data-test-id="bard-mode-desktop-gem-menu"])',
     PICKER_SECONDARY_TEXT: '.picker-secondary-text',
     THINKING_LEVEL_MENU_ITEM:
       'gem-menu-item[value="thinking_level"], gem-menu-item:has-text("思考水平"), gem-menu-item:has-text("Thinking level")',
     SUBMENU_CONTAINER: '.submenu-container, .cdk-overlay-popover',
   } as const;
 
-  public async isModelRunning(page: Page): Promise<boolean> {
-    return await page
-      .evaluate(isModelRunning, this.selectors.STOP_BUTTON)
-      .catch(() => false);
+  protected override async executeStop(worker: PageWorker): Promise<void> {
+    await this.stopTemplate(worker, {
+      isRunningFn: isModelRunning,
+      isRunningArg: this.selectors.STOP_BUTTON,
+      stopButtonSelector: this.selectors.STOP_BUTTON,
+    });
   }
 
-  public async stop(worker: PageWorker): Promise<void> {
-    const existing = this.stoppingPromises.get(worker.page);
-    if (existing) {
-      return existing;
+  /**
+   * 按下 MODEL_PICKER_BUTTON 後有時會彈出元素週期表（compact periodic picker）而非清單。
+   * 偵測到清單檢視按鈕時，先切回清單檢視再繼續操作。
+   */
+  private async ensureListView(page: Page): Promise<void> {
+    const listBtn = page.locator(this.selectors.LIST_VIEW_BUTTON).first();
+    if (await listBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      console.log(`[${this.name}] Periodic-table picker detected, switching back to list view...`);
+      await listBtn.click({ timeout: 5000 });
     }
+  }
 
-    const promise = (async () => {
-      try {
-        this.dirtyPages.add(worker.page);
-        console.log(`[${this.name}] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
+  protected override async setModel(page: Page, model?: string): Promise<void> {
+    const targetModel = model?.trim().toLowerCase();
+    if (!targetModel) return;
 
-        await worker.page.waitForFunction(
-          isModelRunning,
-          this.selectors.STOP_BUTTON,
-          { timeout: 5000 }
-        );
-
-        console.log(`[${this.name}] Worker #${worker.id} model confirmed running. Clicking STOP_BUTTON...`);
-        const stopBtn = worker.page.locator(this.selectors.STOP_BUTTON).first();
-        await stopBtn.click({ timeout: 2000 });
-      } catch (err) {
-        console.warn(`[${this.name}] Worker #${worker.id} stop execution warning:`, err);
+    try {
+      const pickerBtn = page.locator(this.selectors.MODEL_PICKER_BUTTON).first();
+      if (!(await pickerBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+        console.log(`[${this.name}] Model picker button not found, skipping model setting.`);
+        return;
       }
-    })();
 
-    this.stoppingPromises.set(worker.page, promise);
-    try {
-      await promise;
-    } finally {
-      this.stoppingPromises.delete(worker.page);
+      await pickerBtn.click({ timeout: 5000 });
+
+      await this.ensureListView(page);
+
+      const menuItems = page.locator(this.selectors.MODEL_MENU_ITEM);
+      const escaped = targetModel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const matched = menuItems.filter({ hasText: new RegExp(escaped, 'i') });
+      const matchCount = await matched.count();
+
+      if (matchCount > 0 && (await matched.first().isVisible({ timeout: 3000 }).catch(() => false))) {
+        console.log(`[${this.name}] Selecting model: "${targetModel}"...`);
+        await matched.first().click({ timeout: 5000 });
+      } else {
+        console.warn(`[${this.name}] Model "${targetModel}" not found, falling back to the first option (Auto)...`);
+        await menuItems.first().click({ timeout: 5000 });
+      }
+
+      for (let i = 0; i < 3; i++) {
+        const isExpanded = (await pickerBtn.getAttribute('aria-expanded')) === 'true';
+        const hasOverlay = (await page.locator(this.selectors.PICKER_MENU_OVERLAY).count()) > 0;
+        if (isExpanded || hasOverlay)
+          await page.keyboard.press('Escape').catch(() => { });
+        else
+          break;
+      }
+
+      console.log(`[${this.name}] Model switch completed. Ready for prompt input.`);
+    } catch (err) {
+      console.warn(`[${this.name}] setModel warning:`, err);
+      await page.keyboard.press('Escape').catch(() => { });
     }
   }
 
-  public mapThinkingLevel(effort?: string): 'Low' | 'Medium' | 'High' | null {
-    if (!effort) return null;
-    const normalized = effort.trim().toLowerCase().replace(/[-_]/g, '');
-
-    if (['none', 'low'].includes(normalized)) return 'Low';
-    if (['medium'].includes(normalized)) return 'Medium';
-    if (['high', 'xhigh', 'extrahigh'].includes(normalized)) return 'High';
-
-    return null;
-  }
-
-  public async setThinkingLevel(page: Page, level?: string): Promise<void> {
-    const targetLevel = this.mapThinkingLevel(level);
-    if (!targetLevel) return;
+  protected override async setThinkingLevel(page: Page, level?: string): Promise<void> {
+    if (!level) return;
+    let targetLevel: 'low' | 'medium' | 'high';
+    const normalized = level.trim().toLowerCase().replace(/[-_]/g, '');
+    if (['none', 'low'].includes(normalized))
+      targetLevel = 'low';
+    else if (['medium'].includes(normalized))
+      targetLevel = 'medium';
+    else if (['high', 'xhigh', 'extrahigh'].includes(normalized))
+      targetLevel = 'high';
+    else
+      return;
 
     try {
-      const levelMap: Record<'Low' | 'Medium' | 'High', { label: string; regex: RegExp }> = {
-        Low: { label: '低', regex: /^(低|low)$/i },
-        Medium: { label: '中', regex: /^(中|medium)$/i },
-        High: { label: '高', regex: /^(高|high)$/i },
+      const levelMap: Record<'low' | 'medium' | 'high', { label: string; regex: RegExp }> = {
+        low: { label: '低', regex: /^(低|low)$/i },
+        medium: { label: '中', regex: /^(中|medium)$/i },
+        high: { label: '高', regex: /^(高|high)$/i },
       };
       const target = levelMap[targetLevel];
 
       const pickerBtn = page.locator(this.selectors.MODEL_PICKER_BUTTON).first();
-      if (!(await pickerBtn.isVisible({ timeout: 2500 }).catch(() => false))) {
-        console.log('[${this.name}] Model picker button not found, skipping thinking level setting.');
+      if (!(await pickerBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+        console.log(`[${this.name}] Model picker button not found, skipping thinking level setting.`);
         return;
       }
 
       const secondaryTextEl = pickerBtn.locator(this.selectors.PICKER_SECONDARY_TEXT).first();
-      if (await secondaryTextEl.isVisible({ timeout: 1000 }).catch(() => false)) {
+      if (await secondaryTextEl.isVisible({ timeout: 5000 }).catch(() => false)) {
         const currentText = (await secondaryTextEl.innerText().catch(() => '')).trim();
         if (target.regex.test(currentText)) {
           console.log(`[${this.name}] Thinking Level already set to "${currentText}". Skipping menu open.`);
@@ -133,22 +158,20 @@ export class GeminiProvider extends WebAiProvider {
       }
 
       console.log(`[${this.name}] Switching Thinking Level to "${target.label}" (${targetLevel})...`);
+      await pickerBtn.click({ timeout: 5000 });
 
-      await pickerBtn.scrollIntoViewIfNeeded().catch(() => {});
-      await pickerBtn.click({ timeout: 2000 });
-      await page.waitForTimeout(400);
+      // 確保清單檢視（有時會彈出元素週期表）
+      await this.ensureListView(page);
 
       const thinkingItem = page.locator(this.selectors.THINKING_LEVEL_MENU_ITEM).first();
 
-      if (!(await thinkingItem.isVisible({ timeout: 3000 }).catch(() => false))) {
-        console.warn('[${this.name}] "Thinking level" (思考水平) menu item not found.');
-        await page.keyboard.press('Escape').catch(() => {});
+      if (!(await thinkingItem.isVisible({ timeout: 5000 }).catch(() => false))) {
+        console.warn(`[${this.name}] "Thinking level" (思考水平) menu item not found.`);
+        await page.keyboard.press('Escape').catch(() => { });
         return;
       }
 
-      await thinkingItem.hover().catch(() => {});
-      await thinkingItem.click({ timeout: 1500 }).catch(() => {});
-      await page.waitForTimeout(400);
+      await thinkingItem.click({ timeout: 5000 }).catch(() => { });
 
       const submenuItems = page.locator('.submenu-container gem-menu-item, [role="menu"] gem-menu-item');
       const count = await submenuItems.count();
@@ -163,7 +186,7 @@ export class GeminiProvider extends WebAiProvider {
         }
       }
 
-      if (targetOptionLocator && (await targetOptionLocator.isVisible({ timeout: 2000 }).catch(() => false))) {
+      if (targetOptionLocator && (await targetOptionLocator.isVisible({ timeout: 5000 }).catch(() => false))) {
         const isSelected =
           (await targetOptionLocator.getAttribute('class'))?.includes('selected') ||
           (await targetOptionLocator.locator('gem-icon[aria-label*="選取"], mat-icon[data-mat-icon-name="check"]').count()) > 0;
@@ -172,8 +195,7 @@ export class GeminiProvider extends WebAiProvider {
           console.log(`[${this.name}] Option "${target.label}" is already selected.`);
         } else {
           console.log(`[${this.name}] Selecting option "${target.label}"...`);
-          await targetOptionLocator.click({ timeout: 2000 });
-          await page.waitForTimeout(400);
+          await targetOptionLocator.click({ timeout: 5000 });
         }
       } else {
         console.warn(`[${this.name}] Thinking level option "${target.label}" not found in submenu.`);
@@ -182,23 +204,20 @@ export class GeminiProvider extends WebAiProvider {
       for (let i = 0; i < 3; i++) {
         const isExpanded = (await pickerBtn.getAttribute('aria-expanded')) === 'true';
         const hasOverlay = (await page.locator('.cdk-overlay-pane:has(gem-menu)').count()) > 0;
-        if (isExpanded || hasOverlay) {
-          await page.keyboard.press('Escape').catch(() => {});
-          await page.waitForTimeout(200);
-        } else {
+        if (isExpanded || hasOverlay)
+          await page.keyboard.press('Escape').catch(() => { });
+        else
           break;
-        }
       }
 
-      console.log('[${this.name}] Thinking Level switch completed. Ready for prompt input.');
+      console.log(`[${this.name}] Thinking Level switch completed. Ready for prompt input.`);
     } catch (err) {
-      console.warn('[${this.name}] setThinkingLevel warning:', err);
-      await page.keyboard.press('Escape').catch(() => {});
-      await page.waitForTimeout(300);
+      console.warn(`[${this.name}] setThinkingLevel warning:`, err);
+      await page.keyboard.press('Escape').catch(() => { });
     }
   }
 
-  async uploadFile(page: Page, filePath: string): Promise<void> {
+  override async uploadFile(page: Page, filePath: string): Promise<void> {
     console.log(`[${this.name}] Uploading attachment file: ${filePath}`);
 
     const plusBtn = page.locator(this.selectors.PLUS_BUTTON).first();
@@ -213,8 +232,8 @@ export class GeminiProvider extends WebAiProvider {
 
     const agreeBtn = page.locator(this.selectors.DISCLAIMER_AGREE_BUTTON).first();
     try {
-      if (await agreeBtn.isVisible({ timeout: 2000 })) {
-        console.log('[${this.name}] Detected first-time disclaimer dialog, clicking "Agree"...');
+      if (await agreeBtn.isVisible({ timeout: 5000 })) {
+        console.log(`[${this.name}] Detected first-time disclaimer dialog, clicking "Agree"...`);
         await agreeBtn.click();
       }
     } catch {
@@ -226,10 +245,10 @@ export class GeminiProvider extends WebAiProvider {
 
     const previewChip = page.locator(this.selectors.ATTACHMENT_PREVIEW).first();
     await previewChip.waitFor({ state: 'visible', timeout: 20000 });
-    console.log('[${this.name}] Attachment successfully uploaded and mounted.');
+    console.log(`[${this.name}] Attachment successfully uploaded and mounted.`);
   }
 
-  async navigateConversation(page: Page, isNewConversation: boolean, targetPath?: string): Promise<void> {
+  override async navigateConversation(page: Page, isNewConversation: boolean, targetPath?: string): Promise<void> {
     if (isNewConversation) {
       const existingTurns = await page.locator(this.selectors.RESPONSE_CONTAINER).count().catch(() => 0);
       const hasInputText = await page.evaluate((sel: string) => {
@@ -247,7 +266,7 @@ export class GeminiProvider extends WebAiProvider {
         currentUrlObj.pathname !== '/app';
 
       if (isDirty) {
-        console.log('[${this.name}] Page is dirty or starting new session. Force reloading to baseUrl...');
+        console.log(`[${this.name}] Page is dirty or starting new session. Force reloading to baseUrl...`);
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
         this.dirtyPages.delete(page);
       }
@@ -281,10 +300,10 @@ export class GeminiProvider extends WebAiProvider {
       el.textContent = '';
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-    }).catch(() => {});
+    }).catch(() => { });
     await input.fill('');
-    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
-    await page.keyboard.press('Backspace').catch(() => {});
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => { });
+    await page.keyboard.press('Backspace').catch(() => { });
 
     await input.fill(prompt);
     await input.dispatchEvent('input');
@@ -294,8 +313,7 @@ export class GeminiProvider extends WebAiProvider {
     let sent = false;
 
     try {
-      await sendBtn.waitFor({ state: 'visible', timeout: 4000 });
-      await sendBtn.click({ timeout: 2000 });
+      await sendBtn.click({ timeout: 5000 });
       sent = true;
     } catch {
       // Fallback
@@ -309,30 +327,25 @@ export class GeminiProvider extends WebAiProvider {
     await page.waitForTimeout(600);
     const remainingText = await input.innerText().catch(() => '');
     if (remainingText.trim().length > 0) {
-      console.log('[${this.name}] Prompt remaining in editor, executing forced submit...');
-      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      console.log(`[${this.name}] Prompt remaining in editor, executing forced submit...`);
+      await sendBtn.click({ force: true, timeout: 5000 }).catch(() => { });
       await input.focus();
       await page.keyboard.press('Enter');
     }
   }
 
-  async sendPromptAndObserve(
+  override async sendPromptAndObserve(
     worker: PageWorker,
     prompt: string,
     onRawChunk: (delta: string, isReasoning?: boolean) => void,
-    options?: { thinkingLevel?: string; abortSignal?: AbortSignal }
-  ): Promise<{ rawText: string; currentPath: string }> {
+    options: SendPromptOptions
+  ) {
+    const result = await super.sendPromptAndObserve(worker, prompt, onRawChunk, options);
+    if (result)
+      return result;
+
     const { page, emitter, id } = worker;
-
     try {
-      if (options?.abortSignal?.aborted) {
-        this.dirtyPages.add(page);
-        await this.stop(worker);
-        return { rawText: '[Generation Aborted by Client]', currentPath: new URL(page.url()).pathname };
-      }
-
-      await this.setThinkingLevel(page, options?.thinkingLevel);
-
       const turnSnapshot = await this.getTurnSnapshot(page);
       console.log(`[${this.name}] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
 
@@ -352,7 +365,7 @@ export class GeminiProvider extends WebAiProvider {
             ({ turnSelector, prevSnapshot }: WaitForTurnParams) =>
               document.querySelectorAll(turnSelector).length > prevSnapshot,
             { turnSelector: this.selectors.RESPONSE_CONTAINER, prevSnapshot: turnSnapshot },
-            { timeout: 0 }
+            { timeout: 5000 }
           ),
           abortInitialWait,
         ]);
@@ -360,7 +373,7 @@ export class GeminiProvider extends WebAiProvider {
         if (options?.abortSignal?.aborted) {
           console.warn(`[${this.name}] Worker #${id} aborted during initial turn wait. Triggering stop...`);
           await this.stop(worker);
-          return { rawText: '[Generation Aborted by Client]', currentPath: new URL(page.url()).pathname };
+          return { rawText: '[Generation Aborted by Client]', currentPath: this.getCurrentPath(page) };
         }
         throw waitErr;
       }
@@ -402,7 +415,7 @@ export class GeminiProvider extends WebAiProvider {
 
           const evalPromise = page.evaluate(
             ({ turnSelector, targetIndex, stopSelector, thinkSelector, isModelRunningCode }: ObserveStreamParams) => {
-              return new Promise<ObserveResult>((resolve) => {
+              return new Promise<ObserveResult>(async (resolve) => {
                 const container = document.querySelectorAll(turnSelector)[targetIndex] as HTMLElement | undefined;
                 const customWindow = window as unknown as WindowWithCustomEvents;
                 const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
@@ -568,7 +581,7 @@ export class GeminiProvider extends WebAiProvider {
                 let lastChangeTime = Date.now();
                 let isDone = false;
 
-                function emitDelta(): void {
+                async function emitDelta() {
                   if (!container || isDone) return;
 
                   const currentThought = getThoughtText(container);
@@ -576,7 +589,7 @@ export class GeminiProvider extends WebAiProvider {
                     const thoughtDelta = currentThought.slice(lastThoughtLen);
                     lastThoughtLen = currentThought.length;
                     lastChangeTime = Date.now();
-                    customWindow.__pushChunk(
+                    await customWindow.__pushChunk(
                       JSON.stringify({ type: 'reasoning', delta: thoughtDelta })
                     );
                   }
@@ -586,7 +599,7 @@ export class GeminiProvider extends WebAiProvider {
                     const mainDelta = currentMain.slice(lastMainLen);
                     lastMainLen = currentMain.length;
                     lastChangeTime = Date.now();
-                    customWindow.__pushChunk(
+                    await customWindow.__pushChunk(
                       JSON.stringify({ type: 'content', delta: mainDelta })
                     );
                   }
@@ -596,7 +609,7 @@ export class GeminiProvider extends WebAiProvider {
                   if (isDone) return;
                   isDone = true;
 
-                  emitDelta();
+                  await emitDelta();
                   if (observer) observer.disconnect();
                   if (pollInterval !== null) clearInterval(pollInterval);
 
@@ -624,8 +637,8 @@ export class GeminiProvider extends WebAiProvider {
                   resolve({ status, text });
                 }
 
-                const observer = new MutationObserver(() => {
-                  emitDelta();
+                const observer = new MutationObserver(async () => {
+                  await emitDelta();
                 });
 
                 if (container) {
@@ -636,9 +649,9 @@ export class GeminiProvider extends WebAiProvider {
                   });
                 }
 
-                const pollInterval = window.setInterval(() => {
+                const pollInterval = window.setInterval(async () => {
                   if (isDone) return;
-                  emitDelta();
+                  await emitDelta();
 
                   const running = isModelRunning();
                   const currentMain = getMainText(container);
@@ -666,7 +679,7 @@ export class GeminiProvider extends WebAiProvider {
                   }
                 }, 200);
 
-                emitDelta();
+                await emitDelta();
               });
             },
             {
@@ -707,7 +720,7 @@ export class GeminiProvider extends WebAiProvider {
         emitter.off('chunk', chunkListener);
       }
 
-      let currentPath = new URL(page.url()).pathname;
+      let currentPath = this.getCurrentPath(page);
       if (currentPath === '/app') {
         await page
           .waitForFunction(
@@ -715,10 +728,10 @@ export class GeminiProvider extends WebAiProvider {
               const p = new URL(window.location.href).pathname;
               return p.startsWith('/app/') && p.length > 5;
             },
-            { timeout: 3500 }
+            { timeout: 5000 }
           )
-          .catch(() => {});
-        currentPath = new URL(page.url()).pathname;
+          .catch(() => { });
+        currentPath = this.getCurrentPath(page);
       }
 
       const resolvedText = finalMainText.trim() ? finalMainText : rawFullMainText;
@@ -730,7 +743,7 @@ export class GeminiProvider extends WebAiProvider {
       console.error(`[${this.name}] Worker #${id} unexpected error:`, errorMsg);
       return {
         rawText: `[Error]: ${errorMsg}`,
-        currentPath: new URL(page.url()).pathname,
+        currentPath: this.getCurrentPath(page),
       };
     }
   }

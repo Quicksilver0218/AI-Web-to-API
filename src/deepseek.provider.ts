@@ -1,5 +1,5 @@
 import type { Page } from 'playwright';
-import { WebAiProvider } from './web-ai-provider.js';
+import { WebAiProvider, type SendPromptOptions } from './web-ai-provider.js';
 import type { PageWorker, WindowWithCustomEvents } from './types.ts';
 
 interface WaitForTurnParams {
@@ -30,7 +30,7 @@ interface ObserveResult {
 /**
  * 統一的運行狀態判斷函式（瀏覽器環境執行）
  */
-function isModelRunning(): boolean {
+function isModelRunning() {
   const loadingEl = document.querySelector('.ds-loading, .ds-cursor, [class*="loading"], [class*="streaming"]');
   return loadingEl !== null && (loadingEl as HTMLElement).offsetParent !== null;
 }
@@ -38,8 +38,6 @@ function isModelRunning(): boolean {
 export class DeepSeekProvider extends WebAiProvider {
   readonly name = 'DeepSeek';
   readonly baseUrl = 'https://chat.deepseek.com';
-
-  private readonly stoppingPromises = new WeakMap<Page, Promise<void>>();
 
   private readonly selectors = {
     PROMPT_INPUT: 'textarea#chat-input, textarea[placeholder*="DeepSeek"], textarea',
@@ -62,73 +60,47 @@ export class DeepSeekProvider extends WebAiProvider {
     SCROLL_CONTAINER: '.ds-virtual-list.ds-scroll-area',
   } as const;
 
-  public async isModelRunning(page: Page): Promise<boolean> {
-    return await page.evaluate(isModelRunning).catch(() => false);
+  protected override async executeStop(worker: PageWorker): Promise<void> {
+    await this.stopTemplate(worker, {
+      isRunningFn: isModelRunning,
+      stopButtonSelector: this.selectors.SEND_OR_STOP_BUTTON,
+    });
   }
 
-  public async stop(worker: PageWorker): Promise<void> {
-    const existing = this.stoppingPromises.get(worker.page);
-    if (existing) {
-      return existing;
-    }
-
-    const promise = (async () => {
-      try {
-        this.dirtyPages.add(worker.page);
-        console.log(`[${this.name}] Worker #${worker.id} waiting up to 5s for isModelRunning before clicking stop...`);
-
-        await worker.page.waitForFunction(isModelRunning, undefined, { timeout: 5000 });
-
-        console.log(`[${this.name}] Worker #${worker.id} model confirmed running. Clicking SEND_OR_STOP_BUTTON...`);
-        const stopBtn = worker.page.locator(this.selectors.SEND_OR_STOP_BUTTON).first();
-        await stopBtn.click({ timeout: 2000 });
-      } catch (err) {
-        console.warn(`[${this.name}] Worker #${worker.id} stop execution warning:`, err);
-      }
-    })();
-
-    this.stoppingPromises.set(worker.page, promise);
-    try {
-      await promise;
-    } finally {
-      this.stoppingPromises.delete(worker.page);
-    }
-  }
-
-  public async setThinkingLevel(page: Page, level?: string): Promise<void> {
+  protected override async setThinkingLevel(page: Page, level?: string): Promise<void> {
     const normalized = (level ?? '').trim().toLowerCase().replace(/[-_]/g, '');
     const enable = ['medium', 'high', 'xhigh', 'extrahigh'].includes(normalized);
 
     try {
       const toggleLocator = page.locator(this.selectors.DEEPTHINK_BUTTON).filter({ hasText: /深度思考|DeepThink/i }).first();
 
-      if (await toggleLocator.isVisible({ timeout: 2500 })) {
+      if (await toggleLocator.isVisible({ timeout: 5000 })) {
         const ariaPressed = await toggleLocator.getAttribute('aria-pressed');
         const isActive = ariaPressed === 'true';
 
         console.log(`[${this.name}] DeepThink Toggle: currently active=${isActive}, target enable=${enable}`);
 
         if (enable && !isActive) {
-          console.log('[${this.name}] -> Clicking to ENABLE DeepThink...');
-          await toggleLocator.scrollIntoViewIfNeeded().catch(() => {});
-          await toggleLocator.click({ timeout: 2000 });
+          console.log(`[${this.name}] -> Clicking to ENABLE DeepThink...`);
+          await toggleLocator.scrollIntoViewIfNeeded().catch(() => { });
+          await toggleLocator.click({ timeout: 5000 });
 
           const afterPressed = await toggleLocator.getAttribute('aria-pressed');
           if (afterPressed !== 'true') {
-            await toggleLocator.click({ force: true, timeout: 2000 }).catch(() => {});
+            await toggleLocator.click({ force: true, timeout: 5000 }).catch(() => { });
           }
         } else if (!enable && isActive) {
-          console.log('[${this.name}] -> Clicking to DISABLE DeepThink...');
-          await toggleLocator.scrollIntoViewIfNeeded().catch(() => {});
-          await toggleLocator.click({ timeout: 2000 });
+          console.log(`[${this.name}] -> Clicking to DISABLE DeepThink...`);
+          await toggleLocator.scrollIntoViewIfNeeded().catch(() => { });
+          await toggleLocator.click({ timeout: 5000 });
         }
       }
     } catch (err) {
-      console.warn('[${this.name}] setThinkingLevel warning:', err);
+      console.warn(`[${this.name}] setThinkingLevel warning:`, err);
     }
   }
 
-  async uploadFile(page: Page, filePath: string): Promise<void> {
+  override async uploadFile(page: Page, filePath: string): Promise<void> {
     console.log(`[${this.name}] Uploading attachment file: ${filePath}`);
 
     const fileInput = page.locator(this.selectors.FILE_INPUT).first();
@@ -143,10 +115,10 @@ export class DeepSeekProvider extends WebAiProvider {
       await fileChooser.setFiles(filePath);
     }
 
-    console.log('[${this.name}] Attachment uploaded and parsed.');
+    console.log(`[${this.name}] Attachment uploaded and parsed.`);
   }
 
-  async navigateConversation(page: Page, isNewConversation: boolean, targetPath?: string): Promise<void> {
+  override async navigateConversation(page: Page, isNewConversation: boolean, targetPath?: string): Promise<void> {
     if (isNewConversation) {
       const items = await page.locator(this.selectors.TURN_ITEM).count().catch(() => 0);
       const hasInputText = await page.evaluate((sel: string) => {
@@ -159,7 +131,7 @@ export class DeepSeekProvider extends WebAiProvider {
       const isDirty = this.dirtyPages.has(page) || items > 0 || hasInputText || hasFiles > 0 || currentUrlObj.pathname !== '/';
 
       if (isDirty) {
-        console.log('[${this.name}] Page is dirty or starting new session. Force reloading to baseUrl...');
+        console.log(`[${this.name}] Page is dirty or starting new session. Force reloading to baseUrl...`);
         await page.goto(this.baseUrl, { waitUntil: 'domcontentloaded' });
         this.dirtyPages.delete(page);
       }
@@ -201,10 +173,10 @@ export class DeepSeekProvider extends WebAiProvider {
       el.value = '';
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-    }).catch(() => {});
+    }).catch(() => { });
     await input.fill('');
-    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
-    await page.keyboard.press('Backspace').catch(() => {});
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => { });
+    await page.keyboard.press('Backspace').catch(() => { });
 
     await input.fill(prompt);
     await input.dispatchEvent('input');
@@ -213,11 +185,8 @@ export class DeepSeekProvider extends WebAiProvider {
     let sent = false;
 
     try {
-      await sendBtn.waitFor({ state: 'visible', timeout: 5000 });
-      if (await sendBtn.isEnabled({ timeout: 5000 }).catch(() => false)) {
-        await sendBtn.click({ timeout: 2000 });
-        sent = true;
-      }
+      await sendBtn.click({ timeout: 5000 });
+      sent = true;
     } catch {
       // Fallback
     }
@@ -230,30 +199,25 @@ export class DeepSeekProvider extends WebAiProvider {
     await page.waitForTimeout(600);
     const remainingVal = await input.inputValue().catch(() => '');
     if (remainingVal.trim().length > 0) {
-      console.log('[${this.name}] Prompt remaining in input box, executing forced submit...');
-      await sendBtn.click({ force: true, timeout: 2000 }).catch(() => {});
+      console.log(`[${this.name}] Prompt remaining in input box, executing forced submit...`);
+      await sendBtn.click({ force: true, timeout: 5000 }).catch(() => { });
       await input.focus();
       await page.keyboard.press('Enter');
     }
   }
 
-  async sendPromptAndObserve(
+  override async sendPromptAndObserve(
     worker: PageWorker,
     prompt: string,
     onRawChunk: (delta: string, isReasoning?: boolean) => void,
-    options?: { thinkingLevel?: string; abortSignal?: AbortSignal }
-  ): Promise<{ rawText: string; currentPath: string }> {
+    options?: SendPromptOptions
+  ) {
+    const result = await super.sendPromptAndObserve(worker, prompt, onRawChunk, options);
+    if (result)
+      return result;
+
     const { page, emitter, id } = worker;
-
     try {
-      if (options?.abortSignal?.aborted) {
-        this.dirtyPages.add(page);
-        await this.stop(worker);
-        return { rawText: '[Generation Aborted by Client]', currentPath: new URL(page.url()).pathname };
-      }
-
-      await this.setThinkingLevel(page, options?.thinkingLevel);
-
       const turnSnapshot = await this.getTurnSnapshot(page);
       console.log(`[${this.name}] Worker #${id} turn snapshot before prompt: ${turnSnapshot}`);
 
@@ -266,7 +230,7 @@ export class DeepSeekProvider extends WebAiProvider {
             scroller.scrollTop = scroller.scrollHeight;
           }
         }, this.selectors.SCROLL_CONTAINER)
-        .catch(() => {});
+        .catch(() => { });
 
       const abortInitialWait = new Promise<void>((_, reject) => {
         if (options?.abortSignal?.aborted) {
@@ -296,7 +260,7 @@ export class DeepSeekProvider extends WebAiProvider {
         if (options?.abortSignal?.aborted) {
           console.warn(`[${this.name}] Worker #${id} aborted during initial turn wait. Triggering stop...`);
           await this.stop(worker);
-          return { rawText: '[Generation Aborted by Client]', currentPath: new URL(page.url()).pathname };
+          return { rawText: '[Generation Aborted by Client]', currentPath: this.getCurrentPath(page) };
         }
       }
 
@@ -332,7 +296,8 @@ export class DeepSeekProvider extends WebAiProvider {
       const maxRetries = 20;
 
       try {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        let attempt;
+        for (attempt = 1; attempt <= maxRetries; attempt++) {
           if (options?.abortSignal?.aborted) {
             await this.stop(worker);
             finalMainText = '[Generation Aborted by Client]';
@@ -354,7 +319,7 @@ export class DeepSeekProvider extends WebAiProvider {
               initialThoughtLen,
               initialMainLen,
             }: ObserveStreamParams) => {
-              return new Promise<ObserveResult>((resolve) => {
+              return new Promise<ObserveResult>(async (resolve) => {
                 const customWindow = window as unknown as WindowWithCustomEvents;
                 const { rehydrate, hasCompleteToolCall } = (window as any).__webAiHelpers;
                 const checkRunning = rehydrate(isModelRunningCode);
@@ -598,7 +563,7 @@ export class DeepSeekProvider extends WebAiProvider {
                 let lastChangeTime = Date.now();
                 let isDone = false;
 
-                function emitDelta() {
+                async function emitDelta() {
                   if (isDone) return;
                   const turn = getLatestTurnRoot();
                   if (!turn) return;
@@ -608,7 +573,7 @@ export class DeepSeekProvider extends WebAiProvider {
                     const thoughtDelta = currentThought.slice(lastThoughtLen);
                     lastThoughtLen = currentThought.length;
                     lastChangeTime = Date.now();
-                    customWindow.__pushChunk(JSON.stringify({ type: 'reasoning', delta: thoughtDelta }));
+                    await customWindow.__pushChunk(JSON.stringify({ type: 'reasoning', delta: thoughtDelta }));
                   }
 
                   const currentMain = getMainText(turn);
@@ -616,7 +581,7 @@ export class DeepSeekProvider extends WebAiProvider {
                     const mainDelta = currentMain.slice(lastMainLen);
                     lastMainLen = currentMain.length;
                     lastChangeTime = Date.now();
-                    customWindow.__pushChunk(JSON.stringify({ type: 'content', delta: mainDelta }));
+                    await customWindow.__pushChunk(JSON.stringify({ type: 'content', delta: mainDelta }));
                   }
                 }
 
@@ -654,8 +619,8 @@ export class DeepSeekProvider extends WebAiProvider {
                   });
                 }
 
-                const observer = new MutationObserver(() => {
-                  emitDelta();
+                const observer = new MutationObserver(async () => {
+                  await emitDelta();
                 });
 
                 observer.observe(document.body, {
@@ -664,9 +629,9 @@ export class DeepSeekProvider extends WebAiProvider {
                   characterData: true,
                 });
 
-                const pollInterval = window.setInterval(() => {
+                const pollInterval = window.setInterval(async () => {
                   if (isDone) return;
-                  emitDelta();
+                  await emitDelta();
 
                   const warningBtn = document.querySelector('.ds-button--warning');
                   const hasErrorText = (document.body.innerText || '').includes('消息发送过于频繁');
@@ -707,7 +672,7 @@ export class DeepSeekProvider extends WebAiProvider {
                   }
                 }, 200);
 
-                emitDelta();
+                await emitDelta();
               });
             },
             {
@@ -748,10 +713,7 @@ export class DeepSeekProvider extends WebAiProvider {
             console.warn(`[${this.name}] Worker #${id} 遇到頻率限制錯誤。等待 2 秒後點擊重試 (${attempt}/${maxRetries})...`);
             await page.waitForTimeout(2000);
             const retryBtn = page.locator(this.selectors.RATE_LIMIT_RETRY_BUTTON).last();
-            if (await retryBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              await retryBtn.click();
-              await page.waitForTimeout(1000);
-            }
+            await retryBtn.click({ timeout: 5000 });
             continue;
           }
 
@@ -760,11 +722,7 @@ export class DeepSeekProvider extends WebAiProvider {
             await page.waitForTimeout(2000);
 
             const continueBtn = page.locator(this.selectors.CONTINUE_BUTTON).last();
-            if (await continueBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              await continueBtn.scrollIntoViewIfNeeded().catch(() => {});
-              await continueBtn.click({ timeout: 2000 }).catch(() => {});
-              await page.waitForTimeout(1000);
-            }
+            await continueBtn.click({ timeout: 5000 }).catch(() => { });
 
             currentThoughtLen = evalResult.thoughtLen;
             currentMainLen = evalResult.mainLen;
@@ -776,7 +734,8 @@ export class DeepSeekProvider extends WebAiProvider {
         }
 
         if (!finalMainText) {
-          finalMainText = `[Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
+          if (attempt > maxRetries)
+            finalMainText = `[Error]: Maximum retries (${maxRetries}) exceeded without completing response.`;
         }
       } finally {
         if (finalMainText.length > rawFullMainText.length) {
@@ -787,13 +746,13 @@ export class DeepSeekProvider extends WebAiProvider {
         emitter.off('chunk', chunkListener);
       }
 
-      let currentPath = new URL(page.url()).pathname;
+      let currentPath = this.getCurrentPath(page);
       if (currentPath === '/') {
         await page.waitForFunction(
           () => new URL(window.location.href).pathname.startsWith('/a/chat/s/'),
-          { timeout: 3500 }
-        ).catch(() => {});
-        currentPath = new URL(page.url()).pathname;
+          { timeout: 5000 }
+        ).catch(() => { });
+        currentPath = this.getCurrentPath(page);
       }
 
       const resolvedText = finalMainText.trim() ? finalMainText : rawFullMainText;
@@ -805,7 +764,7 @@ export class DeepSeekProvider extends WebAiProvider {
       console.error(`[${this.name}] Worker #${id} unexpected error:`, errorMsg);
       return {
         rawText: `[Error]: ${errorMsg}`,
-        currentPath: new URL(page.url()).pathname,
+        currentPath: this.getCurrentPath(page),
       };
     }
   }

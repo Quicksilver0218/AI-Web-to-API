@@ -111,6 +111,6 @@ export interface ChatCompletionResponse {
 }
 
 export interface WindowWithCustomEvents extends Window {
-  __pushChunk: (delta: string) => void;
-  __pushDone: () => void;
+  __pushChunk: (delta: string) => Promise<void>;
+  __pushDone: () => Promise<void>;
 }

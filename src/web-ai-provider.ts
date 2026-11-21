@@ -29,10 +29,24 @@ export interface ExecuteChatOptions {
   isNewConversation: boolean;
   targetPath?: string;
   tools?: OpenAiTool[];
+  model?: string;
   thinkingLevel?: string;
   abortSignal?: AbortSignal;
   onTextDelta?: (delta: string) => void;
   onReasoningDelta?: (delta: string) => void;
+}
+
+export interface StopTemplateOptions {
+  isRunningFn: (arg: any) => boolean;
+  isRunningArg?: unknown;
+  stopButtonSelector: string;
+  timeoutMs?: number;
+}
+
+export interface SendPromptOptions {
+  model?: string;
+  thinkingLevel?: string;
+  abortSignal?: AbortSignal;
 }
 
 /**
@@ -93,6 +107,7 @@ export abstract class WebAiProvider {
   abstract readonly baseUrl: string;
 
   protected readonly dirtyPages = new WeakSet<Page>();
+  private readonly stoppingPromises = new WeakMap<Page, Promise<void>>();
 
   abstract uploadFile(page: Page, filePath: string): Promise<void>;
 
@@ -102,17 +117,84 @@ export abstract class WebAiProvider {
     targetPath?: string
   ): Promise<void>;
 
-  abstract sendPromptAndObserve(
+  public markPageDirty(page: Page): void {
+    this.dirtyPages.add(page);
+  }
+
+  protected getCurrentPath(page: Page) {
+    return new URL(page.url()).pathname;
+  }
+
+  protected async setModel(page: Page, model: string): Promise<void> { }
+
+  protected async setThinkingLevel(page: Page, level: string): Promise<void> { }
+
+  protected async sendPromptAndObserve(
     worker: PageWorker,
     prompt: string,
     onRawChunk: (delta: string, isReasoning?: boolean) => void,
-    options?: { thinkingLevel?: string; abortSignal?: AbortSignal }
-  ): Promise<{ rawText: string; currentPath: string }>;
+    options?: SendPromptOptions
+  ): Promise<{ rawText: string; currentPath: string } | null> {
+    const { page } = worker;
+    if (options?.abortSignal?.aborted) {
+      this.markPageDirty(page);
+      await this.stop(worker);
+      return { rawText: '[Generation Aborted by Client]', currentPath: this.getCurrentPath(page) };
+    }
+    if (options?.model)
+      await this.setModel(page, options.model);
+    if (options?.thinkingLevel)
+      await this.setThinkingLevel(page, options.thinkingLevel);
 
-  abstract stop(worker: PageWorker): Promise<void>;
+    return null;
+  }
 
-  public markPageDirty(page: Page): void {
-    this.dirtyPages.add(page);
+  protected abstract executeStop(worker: PageWorker): Promise<void>;
+
+  /**
+   * 統一的中止生成入口（內建 WeakMap 防重入鎖，避免重複觸發點擊）
+   */
+  public async stop(worker: PageWorker): Promise<void> {
+    const existing = this.stoppingPromises.get(worker.page);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = this.executeStop(worker);
+    this.stoppingPromises.set(worker.page, promise);
+    try {
+      await promise;
+    } finally {
+      this.stoppingPromises.delete(worker.page);
+    }
+  }
+
+  /**
+   * 共用停止樣板：標記髒頁、等待 isModelRunning 成立（預設最多 5 秒）後單次點擊停止按鈕
+   */
+  protected async stopTemplate(
+    worker: PageWorker,
+    options: StopTemplateOptions
+  ): Promise<void> {
+    const timeoutMs = options.timeoutMs ?? 5000;
+    try {
+      this.dirtyPages.add(worker.page);
+      console.log(
+        `[${this.name}] Worker #${worker.id} waiting up to ${timeoutMs / 1000}s for isModelRunning before clicking stop...`
+      );
+
+      await worker.page.waitForFunction(
+        options.isRunningFn,
+        options.isRunningArg,
+        { timeout: timeoutMs }
+      );
+
+      console.log(`[${this.name}] Worker #${worker.id} model confirmed running. Clicking stop button...`);
+      const stopBtn = worker.page.locator(options.stopButtonSelector).first();
+      await stopBtn.click({ timeout: 5000 });
+    } catch (err) {
+      console.warn(`[${this.name}] Worker #${worker.id} stop execution warning:`, err);
+    }
   }
 
   /**
@@ -275,7 +357,7 @@ export abstract class WebAiProvider {
     return parsedToolName;
   }
 
-  public extractToolCalls(
+  protected extractToolCalls(
     fullText: string,
     tools?: OpenAiTool[]
   ): ExtractToolCallsResult {
@@ -423,6 +505,7 @@ export abstract class WebAiProvider {
       isNewConversation,
       targetPath,
       tools,
+      model,
       thinkingLevel,
       abortSignal,
       onTextDelta,
@@ -566,12 +649,12 @@ export abstract class WebAiProvider {
           }
         };
 
-        const { rawText, currentPath } = await this.sendPromptAndObserve(
+        const { rawText, currentPath } = (await this.sendPromptAndObserve(
           worker,
           promptToSend,
           handleRawChunk,
-          { thinkingLevel, abortSignal }
-        );
+          { model, thinkingLevel, abortSignal }
+        ))!;
 
         this.dirtyPages.add(worker.page);
 

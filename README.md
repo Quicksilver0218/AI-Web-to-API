@@ -18,4 +18,4 @@
    - Base URL: http://localhost:(port)/v1
    - Headers:
      - thinking: `none` / `low` / `medium` / `high` / `xhigh` (default: `medium`)
-   - Add a recognizable model ID as you like
+   - Model ID: Model Name (e.g. `neon`)
