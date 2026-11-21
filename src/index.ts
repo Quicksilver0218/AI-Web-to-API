@@ -4,8 +4,10 @@ import path from 'path';
 import { runLoginFlow as runAiStudioLogin } from './login/ai-studio.login.js';
 import { runLoginFlow as runGeminiLogin } from './login/gemini.login.js';
 import { runLoginFlow as runDeepseekLogin } from './login/deepseek.login.js';
+import { runLoginFlow as runQwenLogin } from './login/qwen.login.js';
 import { DeepSeekProvider } from './providers/deepseek.provider.js';
 import { GeminiProvider } from './providers/gemini.provider.js';
+import { QwenProvider } from './providers/qwen.provider.js';
 import { startServer } from './core/server.js';
 import type { ProviderSelection, StartServerConfig } from './core/server.js';
 import { AiStudioProvider } from './providers/ai-studio.provider.js';
@@ -28,6 +30,10 @@ const AVAILABLE_PROVIDERS: ProviderOption[] = [
   {
     provider: new GeminiProvider(),
     runLoginFlow: runGeminiLogin,
+  },
+  {
+    provider: new QwenProvider(),
+    runLoginFlow: runQwenLogin,
   },
 ];
 

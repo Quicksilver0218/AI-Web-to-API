@@ -1,0 +1,34 @@
+import { BROWSER_OPTIONS } from '@/shared/utils.js';
+import { chromium } from 'playwright';
+import readline from 'readline';
+
+export async function runLoginFlow(profilePath: string): Promise<void> {
+  console.log('[Qwen Login] Launching Chromium window with persistent profile...');
+
+  const context = await chromium.launchPersistentContext(profilePath, {
+    ...BROWSER_OPTIONS,
+    headless: false,
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
+
+  const existingPages = context.pages();
+  const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
+
+  // Qwen chat main entry. The "Log in" button in the page (route /auth) opens SSO
+  // sign-in (Google / Apple / GitHub / email); after auth the app redirects back to chat.qwen.ai.
+  await page.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
+
+  console.log('\n======================================================');
+  console.log('1. Please complete the login process in the opened browser window.');
+  console.log('2. Pass any Cloudflare Turnstile or CAPTCHA verification if prompted.');
+  console.log('3. Verify that you have reached the main Qwen chat interface.');
+  console.log('4. Return to this terminal and press Enter to save the session and exit.');
+  console.log('======================================================\n');
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  await new Promise((resolve) => rl.question('Press Enter after completing login: ', resolve));
+  rl.close();
+
+  await context.close();
+  console.log(`[Qwen Login] Session successfully saved to: ${profilePath}`);
+}
